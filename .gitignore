@@ -1,0 +1,38 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+env/
+
+# VSCode settings
+.vscode/
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+.env.*
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Logs
+*.log
+
+# Output directories and generated files
+output/
+output_local_test.json
+
+# Uploads (optional if files large)
+uploads/
+
+# Notebook checkpoints (if using Jupyter)
+.ipynb_checkpoints/
