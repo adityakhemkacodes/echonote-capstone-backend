@@ -1,28 +1,90 @@
-# app/modules/identity_fusion.py
-
-import math
 from collections import defaultdict, Counter
+from typing import List, Dict, Optional
+import difflib
 
-def fuse_identities(face_tracks, ocr_names, speaker_segments):
+
+def _normalize_name(s: str) -> str:
+    return (s or "").strip().lower()
+
+
+def _name_similarity(a: str, b: str) -> float:
     """
-    Fuse person_id (faces), OCR names, and speaker_id (diarization)
-    into unified participant identities.
+    Cheap fuzzy similarity between two name strings (0..1).
+    Uses a mix of SequenceMatcher and token overlap.
+    """
+    a_norm = _normalize_name(a)
+    b_norm = _normalize_name(b)
+    if not a_norm or not b_norm:
+        return 0.0
+    if a_norm == b_norm:
+        return 1.0
 
-    face_tracks: [{timestamp, bbox, person_id}]
-    ocr_names:   [{timestamp, name}]
-    speaker_segments: [{start, end, speaker}]
+    a_tokens = set(a_norm.split())
+    b_tokens = set(b_norm.split())
+    if not a_tokens or not b_tokens:
+        token_sim = 0.0
+    else:
+        inter = len(a_tokens & b_tokens)
+        union = len(a_tokens | b_tokens)
+        token_sim = inter / union if union > 0 else 0.0
 
-    Returns:
-      participants: list of dicts with:
-        {
-          "participant_id": "PERSON_1",
-          "name": "Aditya Khemka",
-          "speaker_id": "SPEAKER_00",
-          "face_person_id": "PERSON_1"
-        }
+    char_sim = difflib.SequenceMatcher(None, a_norm, b_norm).ratio()
 
-      speaker_to_person: mapping
-      person_to_name: mapping
+    return 0.6 * char_sim + 0.4 * token_sim
+
+
+def _cluster_names_local(names: List[str], threshold: float = 0.78) -> List[List[str]]:
+    """
+    Cluster name variants for a *single person* based on fuzzy similarity.
+    """
+    unique = [n for n in {n for n in names if n}]
+    clusters: List[List[str]] = []
+
+    for name in unique:
+        placed = False
+        for cluster in clusters:
+            if _name_similarity(name, cluster[0]) >= threshold:
+                cluster.append(name)
+                placed = True
+                break
+        if not placed:
+            clusters.append([name])
+
+    return clusters
+
+
+def _choose_canonical_name(aliases: List[str]) -> str:
+    """
+    Pick the nicest human-readable canonical name from aliases:
+      - prefer 2+ tokens
+      - then prefer longer
+    """
+    if not aliases:
+        return ""
+
+    cleaned = [(" ".join(a.split())).strip() for a in aliases if a and a.strip()]
+    if not cleaned:
+        return ""
+
+    def score(n: str):
+        tokens = n.split()
+        return (min(len(tokens), 3), len(n))
+
+    cleaned.sort(key=score, reverse=True)
+    return cleaned[0]
+
+
+def fuse_identities(
+    face_tracks: List[Dict],
+    ocr_names: List[Dict],
+    speaker_segments: List[Dict],
+    transcript_names: Optional[List[str]] = None,  # kept for future use / signature
+):
+    """
+    SAFEST + CORRECT version:
+      - OCR names are linked to person_id via timestamp
+      - Name clustering is done *PER PERSON*, not globally
+      - Transcript names are NOT used for identity assignment
     """
 
     # ---------------------------
@@ -30,83 +92,103 @@ def fuse_identities(face_tracks, ocr_names, speaker_segments):
     # ---------------------------
     person_name_votes = defaultdict(list)
 
-    for name_entry in ocr_names:
-        ts = name_entry["timestamp"]
-        name = name_entry["name"]
+    for entry in ocr_names or []:
+        ts = entry.get("timestamp")
+        name = entry.get("name")
+        if ts is None or not name:
+            continue
 
-        # Find face closest in time
         best_pid = None
-        best_dt = 999
+        best_dt = 999.0
 
-        for f in face_tracks:
-            dt = abs(f["timestamp"] - ts)
+        for f in face_tracks or []:
+            if "timestamp" not in f or "person_id" not in f:
+                continue
+            dt = abs(float(f["timestamp"]) - float(ts))
             if dt < best_dt:
                 best_dt = dt
                 best_pid = f["person_id"]
 
-        if best_pid:
+        if best_pid is not None:
             person_name_votes[best_pid].append(name)
 
-    # Majority vote for each person
-    person_to_name = {}
-    for pid, names in person_name_votes.items():
-        if names:
-            # choose the most common name
-            name = Counter(names).most_common(1)[0][0]
-            person_to_name[pid] = name
-
     # ---------------------------
-    # STEP 2 — Assign speaker_id → person_id
+    # STEP 2 — speaker_id → person_id
     # ---------------------------
     speaker_votes = defaultdict(list)
 
-    for seg in speaker_segments:
-        speaker_id = seg["speaker"]
-        start = seg["start"]
-        end = seg["end"]
-        mid = (start + end) / 2
+    for seg in speaker_segments or []:
+        sid = seg.get("speaker")
+        start, end = seg.get("start"), seg.get("end")
+        if sid is None or start is None or end is None:
+            continue
 
-        # find closest visible face at mid timestamp
-        best_pid = None
-        best_dt = 999
+        mid = (float(start) + float(end)) / 2.0
 
-        for f in face_tracks:
-            dt = abs(f["timestamp"] - mid)
+        best_pid, best_dt = None, 999.0
+        for f in face_tracks or []:
+            if "timestamp" not in f or "person_id" not in f:
+                continue
+            dt = abs(float(f["timestamp"]) - mid)
             if dt < best_dt:
                 best_dt = dt
                 best_pid = f["person_id"]
 
-        if best_pid:
-            speaker_votes[speaker_id].append(best_pid)
+        if best_pid is not None:
+            speaker_votes[sid].append(best_pid)
 
-    speaker_to_person = {}
-    for sid, pids in speaker_votes.items():
-        if pids:
-            # choose the most common person_id
-            person_to_use = Counter(pids).most_common(1)[0][0]
-            speaker_to_person[sid] = person_to_use
+    speaker_to_person = {
+        sid: Counter(pids).most_common(1)[0][0]
+        for sid, pids in speaker_votes.items()
+        if pids
+    }
+
+    # Invert mapping -> person_id → [speaker_ids]
+    person_to_speakers = defaultdict(list)
+    for sid, pid in speaker_to_person.items():
+        person_to_speakers[pid].append(sid)
 
     # ---------------------------
-    # STEP 3 — Build participant list
+    # STEP 3 — Build participants safely
     # ---------------------------
-
+    all_pids = {
+        f["person_id"] for f in (face_tracks or []) if "person_id" in f
+    }
     participants = []
-    all_pids = set(f["person_id"] for f in face_tracks)
+    person_to_name = {}
 
-    for pid in all_pids:
-        name = person_to_name.get(pid, None)
+    for pid in sorted(all_pids):
+        ocr_list = person_name_votes.get(pid, [])
 
-        # find connected speaker_id
-        speaker_id = None
-        for sid, spid in speaker_to_person.items():
-            if spid == pid:
-                speaker_id = sid
+        if not ocr_list:
+            participants.append(
+                {
+                    "participant_id": pid,
+                    "canonical_name": None,
+                    "aliases": [],
+                    "speaker_ids": person_to_speakers.get(pid, []),
+                    "face_person_id": pid,
+                }
+            )
+            continue
 
-        participants.append({
-            "participant_id": pid,
-            "name": name,
-            "face_person_id": pid,
-            "speaker_id": speaker_id
-        })
+        # Cluster *per-person* OCR names
+        clusters = _cluster_names_local(ocr_list)
+        flat_aliases = [item for cluster in clusters for item in cluster]
+
+        canonical = _choose_canonical_name(flat_aliases)
+
+        participants.append(
+            {
+                "participant_id": pid,
+                "canonical_name": canonical,
+                "aliases": sorted(set(flat_aliases)),
+                "speaker_ids": person_to_speakers.get(pid, []),
+                "face_person_id": pid,
+            }
+        )
+
+        if canonical:
+            person_to_name[pid] = canonical
 
     return participants, speaker_to_person, person_to_name

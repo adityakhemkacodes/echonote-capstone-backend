@@ -8,8 +8,10 @@ __pycache__/
 venv/
 env/
 
-# VSCode settings
+# IDE / editor
 .vscode/
+.idea/
+*.iml
 
 # OS-specific
 .DS_Store
@@ -27,12 +29,21 @@ build/
 # Logs
 *.log
 
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
 # Output directories and generated files
 output/
 output_local_test.json
 
-# Uploads (optional if files large)
+# Uploads (meeting files, large user data)
 uploads/
+app/uploads/
+*.mp4
 
 # Notebook checkpoints (if using Jupyter)
 .ipynb_checkpoints/

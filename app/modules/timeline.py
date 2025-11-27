@@ -1,264 +1,333 @@
-# app/modules/timeline.py
-
 from typing import List, Dict, Any, Optional
+from collections import defaultdict
+import math
 
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
 
-def _calculate_impact(from_emotion: str, to_emotion: str) -> float:
+def _group_emotions_by_person(emotions_timeline: List[Dict[str, Any]]):
     """
-    Calculate impact score of an emotion change.
-
-    Higher score = more significant change.
+    Group facial emotion samples by person_id.
+    Each entry in emotions_timeline is expected to look like:
+      { "timestamp": float, "emotion": "neutral", "person_id": "PERSON_1", ... }
     """
-    # Define emotion valence (you can tweak this set)
-    positive_emotions = {"happy", "surprise"}
-    negative_emotions = {"sad", "angry", "fear", "disgust"}
+    by_person = defaultdict(list)
+    for e in emotions_timeline or []:
+        ts = float(e.get("timestamp", 0.0) or 0.0)
+        emo = e.get("emotion") or "neutral"
+        pid = e.get("person_id") or "UNKNOWN"
+        by_person[pid].append((ts, emo))
 
-    from_positive = from_emotion in positive_emotions
-    to_positive = to_emotion in positive_emotions
+    # sort each person's samples by time
+    for pid in by_person:
+        by_person[pid].sort(key=lambda x: x[0])
 
-    # Big swing from positive to negative
-    if from_positive and not to_positive:
-        return 0.9
-    # Big swing from negative to positive
-    elif not from_positive and to_positive:
-        return 0.8
-    # Neutral ↔ non-neutral or same-valence changes
-    else:
-        return 0.5
+    return by_person
 
 
-def _filter_facial_mood_changes(
-    changes: List[Dict[str, Any]], min_gap: float = 1.0
-) -> List[Dict[str, Any]]:
+def _build_streaks(samples, min_duration: float):
     """
-    Remove instant flip-flop mood changes (e.g., neutral→fear→neutral)
-    at the same or very close timestamps.
-
-    Assumes `changes` are sorted by timestamp.
+    Compress (timestamp, emotion) samples into streaks:
+      [{ "start": .., "end": .., "emotion": "happy", "duration": .. }, ...]
+    A streak is a run of the same emotion.
+    Very short streaks (< min_duration) are kept but marked so we can
+    ignore them when detecting mood changes.
     """
-    if not changes:
+    if not samples:
         return []
 
-    filtered: List[Dict[str, Any]] = []
-    last_kept: Optional[Dict[str, Any]] = None
+    streaks = []
+    cur_emo = samples[0][1]
+    start_ts = samples[0][0]
+    last_ts = start_ts
 
-    for ch in changes:
-        if last_kept is None:
-            filtered.append(ch)
-            last_kept = ch
+    for ts, emo in samples[1:]:
+        if emo == cur_emo:
+            last_ts = ts
             continue
 
-        same_time = abs(ch["timestamp"] - last_kept["timestamp"]) < 1e-6
-        reversed_pair = (
-            ch.get("from_emotion") == last_kept.get("to_emotion")
-            and ch.get("to_emotion") == last_kept.get("from_emotion")
+        duration = max(0.01, last_ts - start_ts)
+        streaks.append(
+            {
+                "start": start_ts,
+                "end": last_ts,
+                "emotion": cur_emo,
+                "duration": duration,
+                "is_short": duration < min_duration,
+            }
         )
-        too_close = ch["timestamp"] - last_kept["timestamp"] < min_gap
 
-        # Case 1: exact flip-flop at same timestamp -> ignore this one
-        if same_time and reversed_pair:
-            continue
+        # start new streak
+        cur_emo = emo
+        start_ts = ts
+        last_ts = ts
 
-        # Case 2: flip back very quickly -> treat as noise
-        if reversed_pair and too_close:
-            continue
+    # final streak
+    duration = max(0.01, last_ts - start_ts)
+    streaks.append(
+        {
+            "start": start_ts,
+            "end": last_ts,
+            "emotion": cur_emo,
+            "duration": duration,
+            "is_short": duration < min_duration,
+        }
+    )
 
-        filtered.append(ch)
-        last_kept = ch
-
-    return filtered
+    return streaks
 
 
-def _find_speaker_for_time(
-    speaker_segments: List[Dict[str, Any]], t: float
+def _find_speaker_at_time(
+    speaker_segments: List[Dict[str, Any]],
+    t: float,
 ) -> Optional[str]:
     """
-    Given diarization segments and a timestamp t, find which speaker
-    was talking at that moment (if any).
+    Find diarized speaker id active at time t.
     """
-    best_speaker = None
-    best_overlap = 0.0
-
     for seg in speaker_segments or []:
-        try:
-            s_start = float(seg.get("start", 0.0) or 0.0)
-            s_end = float(seg.get("end", s_start) or s_start)
-        except Exception:
+        s = float(seg.get("start", 0.0) or 0.0)
+        e = float(seg.get("end", s) or s)
+        if s <= t <= e:
+            return seg.get("speaker")
+    return None
+
+
+def _extract_context_snippet(
+    labeled_segments: List[Dict[str, Any]],
+    t: float,
+    window: float = 6.0,
+    max_chars: int = 140,
+) -> Dict[str, Any]:
+    """
+    Extract a small text snippet around time t from speaker-labeled
+    transcript segments.
+
+    Returns:
+      { "snippet": str, "speaker_id": Optional[str] }
+    """
+    if not labeled_segments:
+        return {"snippet": "", "speaker_id": None}
+
+    # Collect segments that overlap [t - window, t + window]
+    start_window = t - window
+    end_window = t + window
+
+    candidates = []
+    for seg in labeled_segments:
+        s = float(seg.get("start", 0.0) or 0.0)
+        e = float(seg.get("end", s) or s)
+        if e < start_window or s > end_window:
             continue
+        candidates.append(seg)
 
-        if s_end <= s_start:
+    if not candidates:
+        return {"snippet": "", "speaker_id": None}
+
+    # Sort by time and concatenate text until we hit max_chars
+    candidates.sort(key=lambda s: float(s.get("start", 0.0) or 0.0))
+    full = []
+    speaker_votes = defaultdict(int)
+
+    for seg in candidates:
+        text = (seg.get("text") or "").strip()
+        if not text:
             continue
+        full.append(text)
+        speaker_id = seg.get("speaker_id")
+        if speaker_id:
+            speaker_votes[speaker_id] += 1
 
-        # Simple inclusion check + tiny overlap window
-        if s_start <= t <= s_end:
-            overlap = s_end - s_start
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_speaker = seg.get("speaker", None)
+    if not full:
+        return {"snippet": "", "speaker_id": None}
 
-    return best_speaker
+    joined = " ".join(full)
+    if len(joined) > max_chars:
+        joined = joined[: max_chars - 3].rstrip() + "..."
 
+    # Pick the speaker that appears most in these segments
+    speaker_id = None
+    if speaker_votes:
+        speaker_id = max(speaker_votes.items(), key=lambda x: x[1])[0]
+
+    return {"snippet": joined, "speaker_id": speaker_id}
+
+
+def _infer_context_type(snippet: str) -> Optional[str]:
+    """
+    Very simple heuristic to label the context:
+      - 'joke / small talk'
+      - 'issue / blocker'
+      - 'decision / planning'
+      - None
+    """
+    s = snippet.lower()
+
+    if any(k in s for k in ["haha", "laugh", "joke", "lol", "pizza", "sushi", "coffee", "cat", "mascot"]):
+        return "joke / small talk"
+
+    if any(k in s for k in ["blocker", "problem", "issue", "error", "bug", "doesn't work", "locked", "crash"]):
+        return "issue / blocker"
+
+    if any(k in s for k in ["decided", "we decided", "we agreed", "decision", "choose", "go with", "plan", "roadmap"]):
+        return "decision / planning"
+
+    return None
+
+
+# -------------------------------------------------------------------
+# Public API
+# -------------------------------------------------------------------
 
 def detect_mood_changes(
     facial_sentiment: Dict[str, Any],
     text_sentiment: Dict[str, Any],
     speaker_segments: List[Dict[str, Any]],
+    speaker_labeled_segments: Optional[List[Dict[str, Any]]] = None,
+    speaker_to_person: Optional[Dict[str, str]] = None,
+    min_streak_duration: float = 4.0,
+    min_gap_seconds: float = 10.0,
+    max_changes: int = 8,
 ) -> List[Dict[str, Any]]:
     """
-    Detect meaningful mood changes primarily from facial emotion timeline.
+    Detect *meaningful* mood changes from facial sentiment, with:
+      - smoothing via emotion streaks
+      - ignoring very short blips
+      - enforcing a minimum time gap between reported changes
+      - attaching person_id, speaker_id, and a short context snippet.
 
-    Steps:
-      1) scan facial emotion timeline in order
-      2) detect changes in emotion
-      3) remove flip-flop / very short-gap noise
-      4) attach impact scores
-      5) (optional) attach which speaker was active at that time
-
-    Returns a list of dicts like:
+    Returns a list of dicts:
       {
         "timestamp": float,
-        "from_emotion": str,
-        "to_emotion": str,
-        "person_id": str | None,
-        "speaker_id": str | None,
+        "from_emotion": "neutral",
+        "to_emotion": "happy",
+        "person_id": "PERSON_1",
+        "speaker_id": "SPEAKER_00" | None,
+        "context_snippet": "...",
+        "context_type": "joke / small talk" | "issue / blocker" | ... | None,
         "impact_score": float,
       }
     """
-    emo_timeline = facial_sentiment.get("emotions_timeline", []) or []
-    if not emo_timeline:
+    emotions_timeline = (facial_sentiment or {}).get("emotions_timeline", []) or []
+    if not emotions_timeline:
         return []
 
-    # Sort by timestamp for consistent processing
-    emo_timeline = sorted(emo_timeline, key=lambda x: x.get("timestamp", 0.0))
+    speaker_to_person = speaker_to_person or {}
 
+    by_person = _group_emotions_by_person(emotions_timeline)
     changes: List[Dict[str, Any]] = []
 
-    # Initialize with the earliest emotion
-    last_emotion = emo_timeline[0].get("emotion", "neutral")
-    last_ts = float(emo_timeline[0].get("timestamp", 0.0) or 0.0)
-    last_person = emo_timeline[0].get("person_id")
+    for pid, samples in by_person.items():
+        streaks = _build_streaks(samples, min_streak_duration)
+        if len(streaks) < 2:
+            continue
 
-    for entry in emo_timeline[1:]:
-        ts = float(entry.get("timestamp", 0.0) or 0.0)
-        emotion = entry.get("emotion", "neutral")
-        person_id = entry.get("person_id")
+        last_change_time = -1e9
 
-        if emotion != last_emotion:
-            change = {
-                "timestamp": ts,
-                "from_emotion": last_emotion,
-                "to_emotion": emotion,
-                "person_id": person_id or last_person,
-                "raw": True,  # mark as raw before filtering
-            }
-            changes.append(change)
+        for i in range(1, len(streaks)):
+            prev_s = streaks[i - 1]
+            curr_s = streaks[i]
 
-            last_emotion = emotion
-            last_ts = ts
-            last_person = person_id or last_person
+            if prev_s["emotion"] == curr_s["emotion"]:
+                continue
+            
+            if curr_s["emotion"] == "neutral":
+                continue
 
-    # Filter flip-flop / noisy changes
-    changes = sorted(changes, key=lambda x: x["timestamp"])
-    changes = _filter_facial_mood_changes(changes, min_gap=1.0)
+            # Require new emotion to be a reasonably long streak
+            if curr_s["duration"] < min_streak_duration:
+                continue
 
-    # Attach impact score and speaker_id (via diarization)
-    for ch in changes:
-        ch["impact_score"] = _calculate_impact(
-            ch["from_emotion"], ch["to_emotion"]
-        )
+            change_time = curr_s["start"]
 
-        # Map to active speaker at that timestamp if diarization is available
-        speaker_id = _find_speaker_for_time(speaker_segments, ch["timestamp"])
-        if speaker_id is not None:
-            ch["speaker_id"] = speaker_id
+            # Enforce minimum gap between reported changes for this person
+            if change_time - last_change_time < min_gap_seconds:
+                continue
 
-        # Raw flag no longer useful outside
-        ch.pop("raw", None)
+            last_change_time = change_time
 
-    # Sort by impact score descending (most important first)
-    changes = sorted(changes, key=lambda x: x["impact_score"], reverse=True)
+            # Attach context snippet + speaker
+            ctx = _extract_context_snippet(
+                speaker_labeled_segments or [],
+                change_time,
+                window=6.0,
+                max_chars=160,
+            )
+            snippet = ctx["snippet"]
+            speaker_id = ctx["speaker_id"]
 
+            # If diarization segments are also provided, fall back to them
+            # to determine speaker when snippet didn't give us one.
+            if speaker_id is None:
+                speaker_id = _find_speaker_at_time(speaker_segments, change_time)
+
+            # Try to infer a coarse context type (joke / blocker / decision)
+            context_type = _infer_context_type(snippet) if snippet else None
+
+            # Impact score ~ how long the new emotion lasts
+            impact_score = curr_s["duration"]
+
+            changes.append(
+                {
+                    "timestamp": round(change_time, 2),
+                    "from_emotion": prev_s["emotion"],
+                    "to_emotion": curr_s["emotion"],
+                    "person_id": pid,
+                    "speaker_id": speaker_id,
+                    "context_snippet": snippet,
+                    "context_type": context_type,
+                    "impact_score": float(impact_score),
+                }
+            )
+
+    # If we have many changes, keep the most impactful ones,
+    # but sort final result by time for readability.
+    if len(changes) > max_changes:
+        changes.sort(key=lambda c: c["impact_score"], reverse=True)
+        changes = changes[:max_changes]
+
+    changes.sort(key=lambda c: c["timestamp"])
     return changes
 
 
 def create_timeline(
     speaker_segments: List[Dict[str, Any]],
     mood_changes: List[Dict[str, Any]],
-    face_tracks: List[Dict[str, Any]],
+    face_tracking_data: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """
-    Build a unified chronological timeline of:
-      - speaker events
-      - mood change events
-      - face appearance events
+    Build a simple combined timeline of speaking segments and mood changes.
 
-    The output is a list of events like:
-      {
-        "timestamp": float,
-        "type": "speech" | "mood_change" | "face",
-        ...additional fields...
-      }
+    Each entry is either:
+      - { "type": "speech_segment", "start": .., "end": .., "speaker_id": .. }
+      - { "type": "mood_change", ...same keys as detect_mood_changes(...) }
     """
     timeline: List[Dict[str, Any]] = []
 
-    # 1) Speaker events from diarization
+    # Speech segments
     for seg in speaker_segments or []:
-        try:
-            start = float(seg.get("start", 0.0) or 0.0)
-            end = float(seg.get("end", start) or start)
-        except Exception:
-            continue
-
-        if end <= start:
-            continue
-
+        s = float(seg.get("start", 0.0) or 0.0)
+        e = float(seg.get("end", s) or s)
         timeline.append(
             {
-                "timestamp": start,
-                "type": "speech",
-                "speaker": seg.get("speaker", "UNKNOWN"),
-                "end": end,
+                "type": "speech_segment",
+                "start": s,
+                "end": e,
+                "speaker_id": seg.get("speaker"),
             }
         )
 
-    # 2) Mood change events
+    # Mood changes (already have timestamp)
     for mc in mood_changes or []:
-        try:
-            ts = float(mc.get("timestamp", 0.0) or 0.0)
-        except Exception:
-            continue
+        entry = dict(mc)
+        entry["type"] = "mood_change"
+        timeline.append(entry)
 
-        event = {
-            "timestamp": ts,
-            "type": "mood_change",
-            "from": mc.get("from_emotion", "neutral"),
-            "to": mc.get("to_emotion", "neutral"),
-            "impact_score": mc.get("impact_score", 0.0),
-        }
+    # Sort by time (speech segments by start, mood changes by timestamp)
+    def _time_key(item: Dict[str, Any]) -> float:
+        if item.get("type") == "mood_change":
+            return float(item.get("timestamp", 0.0) or 0.0)
+        return float(item.get("start", 0.0) or 0.0)
 
-        # Propagate identity if present
-        if "person_id" in mc:
-            event["person_id"] = mc["person_id"]
-        if "speaker_id" in mc:
-            event["speaker_id"] = mc["speaker_id"]
-
-        timeline.append(event)
-
-    # 3) Face appearance events (lightweight)
-    for f in (face_tracks or [])[:100]:
-        try:
-            ts = float(f.get("timestamp", 0.0) or 0.0)
-        except Exception:
-            continue
-
-        timeline.append(
-            {
-                "timestamp": ts,
-                "type": "face",
-                "person_id": f.get("person_id", "Unknown"),
-            }
-        )
-
-    # Final sorting by time
-    timeline.sort(key=lambda x: x["timestamp"])
+    timeline.sort(key=_time_key)
     return timeline

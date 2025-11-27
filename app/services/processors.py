@@ -13,7 +13,11 @@ sys.path.append(str(Path(__file__).parent.parent))
 # Import all processing modules
 from app.modules.transcribe import transcribe_with_speakers
 from app.modules.entity_recognition import extract_entities
-from app.modules.name_detection import detect_participant_names, extract_names_from_video
+from app.modules.name_detection import (
+    detect_participant_names,
+    extract_names_from_video,
+    extract_names_for_tracks,
+)
 from app.modules.face_tracking import track_faces, count_participants
 from app.modules.facial_sentiment import analyze_facial_sentiment
 from app.modules.sentiment import analyze_text_sentiment
@@ -89,15 +93,20 @@ class MeetingProcessor:
         try:
             # 1) Face tracking
             face_data = track_faces(self.video_path)
-            participant_count = count_participants(face_data)
+            rough_participant_count = count_participants(face_data)
 
             # 2) Transcript-based name detection (NER / heuristics)
             transcript_text = self.results.get("transcription", {}).get("full_text", "")
-            detected_names = detect_participant_names(transcript_text)
+            transcript_names = detect_participant_names(transcript_text)
 
-            # 3) OCR names from video overlay
+            # 3) OCR names from video overlay, using per-face label strips
             #    Structure: [{"timestamp": float, "name": "Some Name"}, ...]
-            video_names = extract_names_from_video(self.video_path)
+            video_names = extract_names_for_tracks(self.video_path, face_data)
+
+            # Fallback: if per-face OCR fails for some reason, use the older global method
+            if not video_names:
+                video_names = extract_names_from_video(self.video_path)
+
             ocr_names = video_names
             ocr_name_list = [n["name"] for n in ocr_names]
 
@@ -105,28 +114,56 @@ class MeetingProcessor:
             transcription = self.results.get("transcription", {}) or {}
             speaker_segments = transcription.get("speaker_segments", []) or []
 
-            # 5) Fuse faces + OCR names + speakers into unified identities
+            # 5) Fuse faces + OCR names + speakers (+ transcript names) into unified identities
             participants_fused, speaker_map, person_map = fuse_identities(
                 face_data,
                 ocr_names,
                 speaker_segments,
+                transcript_names=transcript_names,
             )
 
             # 6) Entity recognition for additional context
             entities = extract_entities(transcript_text)
 
-            # 7) Build a clean combined name list (transcript names + OCR names)
-            all_names = list({*(detected_names or []), *ocr_name_list})
+            # 7) Build a global "detected names" list for easy display:
+            #    canonical names if available, falling back to any transcript/OCR names
+            canonical_names = [
+                p["canonical_name"]
+                for p in participants_fused
+                if p.get("canonical_name")
+            ]
 
-            # 8) Save everything in a single participants block
+            # Fallback pool of raw names (transcript + OCR)
+            raw_names = list(set((transcript_names or []) + ocr_name_list))
+
+            # Keep canonical names first, then fill with raw names not already included
+            seen = set()
+            ordered_detected = []
+            for n in canonical_names + raw_names:
+                if not n:
+                    continue
+                key = n.strip().lower()
+                if key not in seen:
+                    seen.add(key)
+                    ordered_detected.append(n)
+
+            # Prefer fused participant count (faces+fusion); fall back to rough face-based estimate
+            participant_count = len(participants_fused) if participants_fused else rough_participant_count
+
+            # IMPORTANT: cap the displayed names to the participant count
+            max_names = participant_count if participant_count else len(ordered_detected)
+            detected_names_for_display = ordered_detected[:max_names]
+
+            # 8) Final participants block
             self.results["participants"] = {
                 "count": participant_count,
-                "participants_fused": participants_fused,   # unified identities
+                "participants": participants_fused,         # unified identities with canonical_name/aliases
+                "participants_fused": participants_fused,   # backward-compatible alias
                 "speaker_to_person": speaker_map,           # "SPEAKER_00" -> "PERSON_1"
-                "person_to_name": person_map,               # "PERSON_1" -> "Aditya Khemka"
-                "detected_names": all_names[:10],           # human-friendly list
+                "person_to_name": person_map,               # "PERSON_1" -> "Aditya Khemka" (canonical)
+                "detected_names": detected_names_for_display,
                 "ocr_names": ocr_name_list[:10],
-                "face_tracking_data": face_data[:200],      # limit size
+                "face_tracking_data": face_data,      
                 "entities": entities[:50],                  # limit entities
             }
 
@@ -137,6 +174,9 @@ class MeetingProcessor:
             self.results["participants"] = {"error": str(e), "count": 0}
             return None
 
+
+
+
     # -------------------------------------------------------------------------
     # STEP 3: SENTIMENT
     # -------------------------------------------------------------------------
@@ -144,16 +184,35 @@ class MeetingProcessor:
         """Step 3: Analyze sentiment from both facial expressions and text"""
         print("\n=== Step 3: Sentiment Analysis ===")
         try:
-            # Get face tracking data
-            face_data = self.results.get("participants", {}).get(
+            # Get full face tracking data
+            full_face_data = self.results.get("participants", {}).get(
                 "face_tracking_data", []
             )
 
-            # Facial sentiment analysis (use more tracks; facial_sentiment handles sampling)
+            # Sample up to ~80 face tracks *evenly across the meeting* so
+            # facial sentiment covers the whole video instead of only the first seconds.
+            face_samples = []
+            if full_face_data:
+                # Sort by timestamp just to be safe
+                full_face_data = sorted(
+                    full_face_data,
+                    key=lambda f: float(f.get("timestamp", 0.0) or 0.0),
+                )
+                max_samples = 80
+                n = len(full_face_data)
+                if n <= max_samples:
+                    face_samples = full_face_data
+                else:
+                    step = n / float(max_samples)
+                    indices = [int(i * step) for i in range(max_samples)]
+                    face_samples = [full_face_data[i] for i in indices]
+
+            # Facial sentiment analysis
             emotions_timeline, overall_facial = analyze_facial_sentiment(
                 self.video_path,
-                face_data[:80],  # give it up to ~80 tracks; module limits internally
+                face_samples,
             )
+
 
             # Text sentiment analysis
             transcript_text = self.results.get("transcription", {}).get(
@@ -196,17 +255,22 @@ class MeetingProcessor:
             sentiment_data = self.results.get("sentiment", {})
             transcript_data = self.results.get("transcription", {})
 
+            participants_block = self.results.get("participants", {}) or {}
+
             mood_changes = detect_mood_changes(
                 sentiment_data.get("facial_sentiment", {}),
                 sentiment_data.get("text_sentiment", {}),
                 transcript_data.get("speaker_segments", []),
+                transcript_data.get("speaker_labeled_segments", []),
+                participants_block.get("speaker_to_person", {}),
             )
 
             timeline = create_timeline(
                 transcript_data.get("speaker_segments", []),
                 mood_changes,
-                self.results.get("participants", {}).get("face_tracking_data", []),
+                participants_block.get("face_tracking_data", []),
             )
+
 
             self.results["timeline"] = {
                 "mood_changes": mood_changes,
@@ -243,7 +307,7 @@ class MeetingProcessor:
             self.results["topics"] = {"error": str(e)}
             return None
 
-    # -------------------------------------------------------------------------
+        # -------------------------------------------------------------------------
     # STEP 6: SUMMARY & ACTIONABLE INSIGHTS
     # -------------------------------------------------------------------------
     def generate_insights(self) -> Dict[str, Any]:
@@ -270,12 +334,13 @@ class MeetingProcessor:
 
         # 2) Action items
         try:
-            # Pass speaker segments (plain diarization); function is regex-based on text today
+            # Use speaker-labeled segments + participants so we can attach assignees
             action_items = extract_action_items(
                 transcript_text,
                 self.results.get("transcription", {}).get(
                     "speaker_labeled_segments", []
                 ),
+                self.results.get("participants", {}),
             )
         except Exception as e:
             print(f"✗ Error extracting action items: {e}")
@@ -290,6 +355,7 @@ class MeetingProcessor:
             self.results["insights"]["error"] = error
 
         return self.results["insights"]
+
 
     # -------------------------------------------------------------------------
     # ORCHESTRATOR

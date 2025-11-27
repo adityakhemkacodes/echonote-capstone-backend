@@ -1,17 +1,19 @@
 # app/modules/summarizer.py
+
 import re
 import warnings
 from typing import List, Dict, Any, Optional
 
-from sentence_transformers import SentenceTransformer, util
+from transformers import pipeline
 
 warnings.filterwarnings("ignore")
 
-_embedder = None
-_proto_built = False
-_action_proto = None
-_decision_proto = None
-_context_proto = None
+# -------------------------------------------------------------------
+# Global models
+# -------------------------------------------------------------------
+
+_summarizer = None
+_zsc = None  # zero-shot classifier
 
 # Sentences containing any of these keywords will be dropped
 # from summary + action items as "chit-chat".
@@ -29,152 +31,126 @@ _NOISE_KEYWORDS = [
     "crying",
     "dark mode",
     "coffee machine",
-]
-
-# Prototype phrases for semantic classification
-_ACTION_PROTOTYPES = [
-    "finish the feature",
-    "implement the API",
-    "fix the bug",
-    "deploy the change",
-    "write tests",
-    "update the documentation",
-    "schedule a follow up meeting",
-    "create a ticket",
-    "prepare the report",
-    "complete the task",
-]
-
-_DECISION_PROTOTYPES = [
-    "we decided that",
-    "we will go with this approach",
-    "we agreed to",
-    "the final decision is",
-    "we chose this option",
-    "we will not implement this",
-    "we will postpone this",
-]
-
-_CONTEXT_PROTOTYPES = [
-    "today's meeting is about",
-    "current status of the project",
-    "progress update",
-    "overview of the sprint",
-    "discussion about the roadmap",
-    "summary of the work so far",
+    "weather",
+    "weekend",
 ]
 
 
-def _get_embedder():
-    global _embedder
-    if _embedder is None:
-        print("Loading sentence embedding model (all-MiniLM-L6-v2)...")
-        _embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-    return _embedder
+def _get_summarizer():
+    """Lazy-load transformer summarization model."""
+    global _summarizer
+    if _summarizer is None:
+        print("Loading transformer summarization model (bart-large-cnn)...")
+        _summarizer = pipeline(
+            "summarization",
+            model="facebook/bart-large-cnn",
+        )
+    return _summarizer
 
 
-def _build_prototypes():
-    global _proto_built, _action_proto, _decision_proto, _context_proto
-    if _proto_built:
-        return
+def _get_zsc():
+    """Lazy-load zero-shot classification model."""
+    global _zsc
+    if _zsc is None:
+        print("Loading zero-shot classifier (bart-large-mnli)...")
+        _zsc = pipeline(
+            "zero-shot-classification",
+            model="facebook/bart-large-mnli",
+        )
+    return _zsc
 
-    print("Building semantic class prototypes for sentence classification...")
-    model = _get_embedder()
 
-    action_emb = model.encode(_ACTION_PROTOTYPES, convert_to_tensor=True)
-    decision_emb = model.encode(_DECISION_PROTOTYPES, convert_to_tensor=True)
-    context_emb = model.encode(_CONTEXT_PROTOTYPES, convert_to_tensor=True)
-
-    # Average each class into a single prototype vector
-    _action_proto = action_emb.mean(dim=0, keepdim=True)
-    _decision_proto = decision_emb.mean(dim=0, keepdim=True)
-    _context_proto = context_emb.mean(dim=0, keepdim=True)
-    _proto_built = True
-
+# -------------------------------------------------------------------
+# Basic text helpers
+# -------------------------------------------------------------------
 
 def _split_into_sentences(text: str) -> List[str]:
-    # crude but works well enough for meeting transcripts
+    """Crude sentence splitter for meeting transcripts."""
     raw = re.split(r"(?<=[.!?])\s+", text.strip())
     return [s.strip() for s in raw if len(s.strip()) > 0]
 
 
 def _is_noise_sentence(s: str) -> bool:
     lower = s.lower()
+    if len(lower.split()) < 4:
+        # very short sentences are usually not helpful
+        return True
     return any(k in lower for k in _NOISE_KEYWORDS)
 
 
-def _classify_sentences(sentences: List[str]) -> List[Dict[str, Any]]:
+def _clean_sentence(s: str) -> Optional[str]:
+    """Filter obviously broken / useless sentences."""
+    s = (s or "").strip()
+    if not s:
+        return None
+    if len(s) < 25:  # very tiny fragments
+        return None
+    if len(s) > 400:  # way too long
+        return None
+    if _is_noise_sentence(s):
+        return None
+    return s
+
+
+def _summarize_long_text(text: str, max_chunk_chars: int = 2500) -> str:
     """
-    For each sentence, compute similarity to action/decision/context prototypes.
-    Returns list of dicts with classification info.
+    Summarize arbitrarily long text by:
+      1) chunking
+      2) summarizing each chunk
+      3) summarizing the concatenated chunk summaries
     """
-    if not sentences:
-        return []
+    summarizer = _get_summarizer()
 
-    _build_prototypes()
-    model = _get_embedder()
+    text = text.strip()
+    if len(text) <= max_chunk_chars:
+        result = summarizer(
+            text,
+            max_length=220,
+            min_length=60,
+            do_sample=False,
+        )[0]["summary_text"]
+        return result.strip()
 
-    sent_embs = model.encode(sentences, convert_to_tensor=True)
+    # Split into overlapping chunks
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + max_chunk_chars
+        chunk = text[start:end]
+        # try not to cut in the middle of a sentence
+        last_period = chunk.rfind(".")
+        if last_period > 0 and last_period > len(chunk) * 0.6:
+            chunk = chunk[: last_period + 1]
+            end = start + last_period + 1
+        chunks.append(chunk)
+        start = end
 
-    action_sim = util.cos_sim(sent_embs, _action_proto)[:, 0]
-    decision_sim = util.cos_sim(sent_embs, _decision_proto)[:, 0]
-    context_sim = util.cos_sim(sent_embs, _context_proto)[:, 0]
-
-    results = []
-    for idx, s in enumerate(sentences):
-        a = float(action_sim[idx])
-        d = float(decision_sim[idx])
-        c = float(context_sim[idx])
-
-        # choose label by max similarity
-        label = "context"
-        score = c
-        if a > d and a > c:
-            label = "action"
-            score = a
-        elif d > a and d > c:
-            label = "decision"
-            score = d
-
-        results.append(
-            {
-                "sentence": s,
-                "label": label,
-                "score": score,
-                "action_score": a,
-                "decision_score": d,
-                "context_score": c,
-            }
-        )
-
-    return results
-
-
-def _select_top_sentences(classified, label, max_items, min_score=0.2):
-    """
-    Pick top sentences of a given label, with score threshold
-    and noise filtering.
-    """
-    candidates = [
-        c for c in classified if c["label"] == label and c["score"] >= min_score
-    ]
-    # keep original order by transcript, but bias to higher scores
-    # sort by score desc but keep stable ordering via enumerate index
-    indexed = list(enumerate(candidates))
-    indexed.sort(key=lambda x: (-x[1]["score"], x[0]))
-    chosen = []
-
-    for _, c in indexed:
-        s = c["sentence"].strip()
-        if _is_noise_sentence(s):
+    partial_summaries = []
+    for ch in chunks:
+        ch = ch.strip()
+        if not ch:
             continue
-        if s not in chosen:
-            chosen.append(s)
-        if len(chosen) >= max_items:
-            break
+        res = summarizer(
+            ch,
+            max_length=160,
+            min_length=40,
+            do_sample=False,
+        )[0]["summary_text"]
+        partial_summaries.append(res.strip())
 
-    return chosen
+    joined = " ".join(partial_summaries)
+    final = summarizer(
+        joined,
+        max_length=230,
+        min_length=70,
+        do_sample=False,
+    )[0]["summary_text"]
+    return final.strip()
 
+
+# -------------------------------------------------------------------
+# Transformer-augmented summary
+# -------------------------------------------------------------------
 
 def generate_summary(
     transcript: str,
@@ -184,12 +160,23 @@ def generate_summary(
 ):
     """
     Generate comprehensive meeting summary, focusing on:
-    - main discussion points
-    - decisions
-    - action items
+      - high-level transformer-based overview
+      - key discussion points (from topic segmentation)
+      - decisions
+      - action highlights
 
-    Uses sentence-transformers to classify sentences instead of
-    a generative LLM, so it runs fully locally.
+    Returns a dict with:
+      {
+        "main_summary": str,          # human-readable block (for CLI)
+        "overview": str,              # transformer summary paragraph
+        "key_points": List[str],
+        "decisions": List[str],
+        "action_highlights": List[str],
+        "participant_count": int,
+        "detected_names": List[str],
+        "overall_sentiment": Dict,
+        "key_topics": List[Any],
+      }
     """
     print("Generating meeting summary...")
 
@@ -197,74 +184,115 @@ def generate_summary(
     MIN_WORDS = 20
     word_count = len(transcript.split())
 
+    base_payload = {
+        "participant_count": participants.get("count", 0) if participants else 0,
+        "detected_names": participants.get("detected_names", []) if participants else [],
+        "overall_sentiment": sentiment_data.get("overall_mood", {}) if sentiment_data else {},
+        "key_topics": topics.get("topics", [])[:3] if topics and isinstance(topics, dict) else [],
+    }
+
     if not transcript or word_count < MIN_WORDS:
         print(f"✗ Not enough transcript text for summarization (words={word_count})")
         return {
+            **base_payload,
             "main_summary": "Not enough speech was detected to generate a meaningful summary.",
-            "participant_count": participants.get("count", 0) if participants else 0,
-            "detected_names": participants.get("detected_names", []) if participants else [],
-            "overall_sentiment": sentiment_data.get("overall_mood", {}) if sentiment_data else {},
-            "key_topics": topics.get("topics", [])[:3] if topics else [],
+            "overview": "",
+            "key_points": [],
+            "decisions": [],
+            "action_highlights": [],
         }
 
-    # Cut extremely long transcripts
-    max_chars = 8000
+    # Cut extremely long transcripts to keep things bounded
+    max_chars = 12000
     transcript = transcript[:max_chars]
 
     try:
+        # 1) High-level overview with transformer summarizer
+        overview = _summarize_long_text(transcript)
+
+        # 2) Key discussion points – lean on topic segmentation
+        key_points: List[str] = []
+        if topics and isinstance(topics, dict) and topics.get("topics"):
+            for t in topics["topics"][:3]:
+                summary = (t.get("summary") or "").strip()
+                if summary:
+                    key_points.append(summary)
+
+        # Fallback if no topics or no summaries
+        if not key_points:
+            sentences = [_clean_sentence(s) for s in _split_into_sentences(transcript)]
+            key_points = [s for s in sentences if s][:3]
+
+        # 3) Decisions & action highlights via zero-shot classifier
+        zsc = _get_zsc()
         sentences = _split_into_sentences(transcript)
+        # keep only reasonably sized, non-noise sentences
+        sentences = [s for s in (_clean_sentence(s) for s in sentences) if s]
 
-        # Remove ultra-short or ultra-long sentences
-        sentences = [
-            s for s in sentences if 10 <= len(s) <= 300
-        ]  # filter extremes
+        # To control cost, limit to first N sentences
+        MAX_SENTENCES_FOR_CLASS = 80
+        sentences = sentences[:MAX_SENTENCES_FOR_CLASS]
 
-        classified = _classify_sentences(sentences)
+        decisions: List[str] = []
+        action_highlights: List[str] = []
 
-        # Key points: mostly context + some high-scoring actions/decisions
-        key_context = _select_top_sentences(classified, "context", max_items=5, min_score=0.15)
-        key_decisions = _select_top_sentences(classified, "decision", max_items=4, min_score=0.20)
-        key_actions = _select_top_sentences(classified, "action", max_items=6, min_score=0.20)
+        candidate_labels = ["decision", "action item", "status update", "small talk"]
 
-        # If no action sentences were classified, we still fall back to regex-based extraction
-        # via extract_action_items() for the "Action items" section below.
+        for s in sentences:
+            result = zsc(s, candidate_labels=candidate_labels, multi_label=False)
+            if not result or not result.get("labels"):
+                continue
+            label = result["labels"][0]
+            score = float(result["scores"][0])
 
-        # Build human-readable block summary
-        lines = []
+            if label == "decision" and score >= 0.8:
+                if s not in decisions:
+                    decisions.append(s)
+            elif label == "action item" and score >= 0.8:
+                if s not in action_highlights:
+                    action_highlights.append(s)
 
-        if key_context:
+            # stop if we have enough
+            if len(decisions) >= 5 and len(action_highlights) >= 5:
+                break
+
+        # 4) Build human-readable block summary for CLI
+        lines: List[str] = []
+        if overview:
+            lines.append(overview.strip())
+            lines.append("")
+
+        if key_points:
             lines.append("Key discussion points:")
-            for s in key_context:
+            for s in key_points:
                 lines.append(f"- {s}")
             lines.append("")
 
-        if key_decisions:
+        if decisions:
             lines.append("Decisions made:")
-            for s in key_decisions:
+            for s in decisions:
                 lines.append(f"- {s}")
             lines.append("")
 
-        # Note: the actual action items list is generated below and printed in run_local_test;
-        # here we only provide a brief subset in the summary text.
-        if key_actions:
+        if action_highlights:
             lines.append("Action highlights:")
-            for s in key_actions[:3]:
+            for s in action_highlights[:5]:
                 lines.append(f"- {s}")
             lines.append("")
 
-        # If we somehow got nothing, fall back to first 3 sentences
         if not lines:
-            fallback = " ".join(sentences[:3])
-            lines = [fallback]
+            # extreme fallback – shouldn't really happen
+            lines = [overview or transcript[:500]]
 
         main_summary_text = "\n".join(lines).strip()
 
         enhanced_summary = {
+            **base_payload,
             "main_summary": main_summary_text,
-            "participant_count": participants.get("count", 0) if participants else 0,
-            "detected_names": participants.get("detected_names", []) if participants else [],
-            "overall_sentiment": sentiment_data.get("overall_mood", {}) if sentiment_data else {},
-            "key_topics": topics.get("topics", [])[:3] if topics else [],
+            "overview": overview,
+            "key_points": key_points,
+            "decisions": decisions,
+            "action_highlights": action_highlights,
         }
 
         print("✓ Summary generated")
@@ -274,16 +302,17 @@ def generate_summary(
         print(f"✗ Error generating summary: {e}")
         fallback = transcript[:500] + "..." if len(transcript) > 500 else transcript
         return {
+            **base_payload,
             "main_summary": fallback,
-            "participant_count": participants.get("count", 0) if participants else 0,
-            "detected_names": participants.get("detected_names", []) if participants else [],
-            "overall_sentiment": sentiment_data.get("overall_mood", {}) if sentiment_data else {},
-            "key_topics": topics.get("topics", [])[:3] if topics else [],
+            "overview": "",
+            "key_points": [],
+            "decisions": [],
+            "action_highlights": [],
         }
 
 
 # -------------------------------------------------------------------
-# Action items extraction (regex + noise filtering)
+# Action items extraction (regex + zero-shot filtering)
 # -------------------------------------------------------------------
 
 def extract_action_items(
@@ -294,14 +323,14 @@ def extract_action_items(
     """
     Extract action items and tasks from meeting transcript.
 
-    - Uses regex pattern matching to find action-oriented phrases.
-    - Filters out obvious non-business chatter (coffee, jokes, etc).
-    - If identity information is available (participants_fused / speaker map),
-      this function is ready to add assignee information later, but for now
-      it keeps results text-only and backward compatible.
+    Pipeline:
+      1) regex to find candidate action phrases
+      2) clean up fragments
+      3) use zero-shot classifier to keep only real "action item" sentences
+      4) simple dedupe
 
     Returns a list of dicts:
-      { "action": str, "confidence": "medium", "assignee": Optional[str] }
+      { "action": str, "confidence": "medium|high", "assignee": Optional[str] }
     """
     print("Extracting action items...")
 
@@ -309,9 +338,9 @@ def extract_action_items(
     if not transcript:
         return []
 
-    action_items: List[Dict[str, Any]] = []
+    # --- Step 1: regex-based candidates ---
+    raw_candidates: List[str] = []
 
-    # Common action phrases
     action_patterns = [
         r"(?:will|should|need to|must|have to|going to)\s+([^.!?]+)",
         r"action item[s]?:\s*([^.!?]+)",
@@ -323,15 +352,18 @@ def extract_action_items(
     for pattern in action_patterns:
         matches = re.finditer(pattern, transcript, re.IGNORECASE)
         for match in matches:
-            action_text = match.group(1).strip()
-
-            # Filter out very short or very long items
-            if not (10 < len(action_text) < 200):
+            fragment = match.group(1).strip()
+            if not fragment:
                 continue
 
-            lower = action_text.lower()
+            # Trim at first sentence boundary
+            fragment = re.split(r"[.;]", fragment)[0].strip()
 
-            # Drop noisy / non-business actions
+            # Drop very short / very long
+            if not (10 < len(fragment) < 200):
+                continue
+
+            lower = fragment.lower()
             if any(k in lower for k in _NOISE_KEYWORDS):
                 continue
 
@@ -347,31 +379,671 @@ def extract_action_items(
                 if not re.search(r"\b(done|complete|before)\b", lower):
                     continue
 
-            # --- Assignee placeholder (future-proof for identity fusion) ---
-            assignee: Optional[str] = None
+            raw_candidates.append(fragment)
 
-            # NOTE: To reliably map this action to a specific speaker/name,
-            # we would need word- or sentence-level timestamps from Whisper
-            # and align them with diarization + participants_fused.
-            # For now we keep 'assignee' = None to avoid incorrect attribution.
+    if not raw_candidates:
+        print("✓ No regex-based action candidates found")
+        return []
+
+    # --- Step 2: zero-shot classification to keep genuine actions ---
+    zsc = _get_zsc()
+    labels = ["action item", "decision", "status update", "small talk"]
+
+    filtered_items: List[Dict[str, Any]] = []
+
+    for frag in raw_candidates:
+        try:
+            result = zsc(frag, candidate_labels=labels, multi_label=False)
+            if not result or not result.get("labels"):
+                continue
+            top_label = result["labels"][0]
+            score = float(result["scores"][0])
+
+            if top_label != "action item" or score < 0.75:
+                continue
+
+            confidence = "high" if score >= 0.9 else "medium"
+            filtered_items.append(
+                {
+                    "action": frag,
+                    "confidence": confidence,
+                    "assignee": None,  # ready for future identity linking
+                }
+            )
+        except Exception:
+            # If classifier breaks on a sentence, just skip it
+            continue
+
+    # --- Step 3: dedupe by normalized text ---
+    seen = set()# app/modules/summarizer.py
+
+import re
+import warnings
+from typing import List, Dict, Any, Optional
+
+from transformers import pipeline
+
+warnings.filterwarnings("ignore")
+
+# -------------------------------------------------------------------
+# Global models (lazy loaded)
+# -------------------------------------------------------------------
+
+_summarizer = None
+_zs_classifier = None
+
+# Sentences containing any of these keywords will be dropped
+# from summarization and action extraction as "chit-chat".
+_NOISE_KEYWORDS = [
+    "coffee",
+    "tea",
+    "lunch",
+    "snack",
+    "pizza",
+    "mascot",
+    "cat ",
+    "cats ",
+    "joke",
+    "laugh",
+    "crying",
+    "dark mode powered by chaos",
+    "coffee machine",
+    "construction noise",
+    "wifi",
+    "wi-fi",
+    "headset",
+]
+
+
+def _get_summarizer():
+    """Lazy-load abstractive summarization model."""
+    global _summarizer
+    if _summarizer is None:
+        print("Loading transformer summarization model (bart-large-cnn)...")
+        _summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+    return _summarizer
+
+
+def _get_zs_classifier():
+    """Lazy-load zero-shot classifier."""
+    global _zs_classifier
+    if _zs_classifier is None:
+        print("Loading zero-shot classifier (bart-large-mnli)...")
+        _zs_classifier = pipeline(
+            "zero-shot-classification", model="facebook/bart-large-mnli"
+        )
+    return _zs_classifier
+
+
+# -------------------------------------------------------------------
+# Basic text utilities
+# -------------------------------------------------------------------
+
+
+def _split_into_sentences(text: str) -> List[str]:
+    """Crude sentence splitter, good enough for transcripts."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    raw = re.split(r"(?<=[.!?])\s+", text)
+    return [s.strip() for s in raw if len(s.strip()) > 0]
+
+
+def _is_noise_sentence(s: str) -> bool:
+    lower = s.lower()
+    return any(k in lower for k in _NOISE_KEYWORDS)
+
+
+def _clean_transcript_for_summarization(text: str) -> str:
+    """
+    Remove obvious small talk / setup noise so the summarizer
+    focuses on the actual meeting content.
+    """
+    sentences = _split_into_sentences(text)
+    cleaned: List[str] = []
+
+    for s in sentences:
+        if len(s) < 15:
+            # ultra-short fragments are usually ASR noise or fillers
+            continue
+
+        lower = s.lower()
+
+        # greetings / closings / pure chit-chat
+        if any(
+            p in lower
+            for p in [
+                "thanks for joining",
+                "can you hear me",
+                "hope you can both hear me",
+                "sorry",
+                "apologies",
+                "loud and clear",
+                "anyone else",
+                "anything else important",
+                "meeting adjourned",
+                "see you",
+            ]
+        ):
+            continue
+
+        if _is_noise_sentence(s):
+            continue
+
+        cleaned.append(s)
+
+    # fallback: if we stripped too aggressively, use original text
+    if len(" ".join(cleaned).split()) < 30:
+        return text.strip()
+
+    return " ".join(cleaned)
+
+
+# -------------------------------------------------------------------
+# Main summary generation
+# -------------------------------------------------------------------
+
+
+def generate_summary(
+    transcript: str,
+    sentiment_data: Dict[str, Any] = None,
+    topics: Dict[str, Any] = None,
+    participants: Dict[str, Any] = None,
+) -> Dict[str, Any]:
+    """
+    Generate a clean, human-readable meeting summary.
+
+    - Uses BART (facebook/bart-large-cnn) for abstractive summarization
+    - Cleans out obvious noise before summarizing
+    - Optionally uses topic segments for "key topics"
+    """
+
+    print("Generating meeting summary...")
+
+    transcript = (transcript or "").strip()
+    MIN_WORDS = 20
+    word_count = len(transcript.split())
+
+    if not transcript or word_count < MIN_WORDS:
+        print(f"✗ Not enough transcript text for summarization (words={word_count})")
+        return {
+            "main_summary": "Not enough speech was detected to generate a meaningful summary.",
+            "participant_count": participants.get("count", 0) if participants else 0,
+            "detected_names": participants.get("detected_names", [])
+            if participants
+            else [],
+            "overall_sentiment": sentiment_data.get("overall_mood", {})
+            if sentiment_data
+            else {},
+            "key_topics": topics.get("topics", [])[:3] if topics else [],
+        }
+
+    try:
+        # 1) Clean transcript (remove chit-chat, noise etc.)
+        cleaned = _clean_transcript_for_summarization(transcript)
+
+        # Limit to ~8000 characters for the summarization model
+        max_chars = 8000
+        cleaned = cleaned[:max_chars]
+
+        summarizer = _get_summarizer()
+
+        # 2) High-level abstractive summary
+        # Adjust max/min length according to your typical meeting size
+        summary_output = summarizer(
+            cleaned,
+            max_length=180,
+            min_length=60,
+            do_sample=False,
+            truncation=True,
+        )[0]["summary_text"].strip()
+
+        # 3) Optional: derive concise key topic summaries
+        key_topics: List[str] = []
+        if isinstance(topics, dict) and topics.get("topics"):
+            # Take top 2–3 topic blobs and compress each a bit
+            for t in topics["topics"][:3]:
+                txt = (t.get("summary") or "").strip()
+                if not txt:
+                    continue
+                # Short summarization per topic (keep it cheap)
+                try:
+                    topic_sum = summarizer(
+                        txt,
+                        max_length=60,
+                        min_length=20,
+                        do_sample=False,
+                        truncation=True,
+                    )[0]["summary_text"].strip()
+                    key_topics.append(topic_sum)
+                except Exception:
+                    key_topics.append(txt[:200])
+
+        enhanced_summary = {
+            "main_summary": summary_output,
+            "participant_count": participants.get("count", 0) if participants else 0,
+            "detected_names": participants.get("detected_names", [])
+            if participants
+            else [],
+            "overall_sentiment": sentiment_data.get("overall_mood", {})
+            if sentiment_data
+            else {},
+            "key_topics": key_topics,
+        }
+
+        print("✓ Summary generated")
+        return enhanced_summary
+
+    except Exception as e:
+        print(f"✗ Error generating summary: {e}")
+        fallback = transcript[:500] + "..." if len(transcript) > 500 else transcript
+        return {
+            "main_summary": fallback,
+            "participant_count": participants.get("count", 0) if participants else 0,
+            "detected_names": participants.get("detected_names", [])
+            if participants
+            else [],
+            "overall_sentiment": sentiment_data.get("overall_mood", {})
+            if sentiment_data
+            else {},
+            "key_topics": topics.get("topics", [])[:3] if topics else [],
+        }
+
+
+# -------------------------------------------------------------------
+# Action items extraction (speaker-aware + zero-shot + regex)
+# -------------------------------------------------------------------
+
+
+def _has_action_cue(text: str) -> bool:
+    """Cheap filter to pre-select sentences that might contain an action."""
+    lower = text.lower()
+    cues = [
+        "i'll ",
+        "i will ",
+        "we'll ",
+        "we will ",
+        "you will ",
+        "you'll ",
+        "should ",
+        "need to ",
+        "have to ",
+        "must ",
+        "going to ",
+        "let's ",
+        "to do ",
+        "todo ",
+        "action item",
+        "before next meeting",
+        "before friday",
+        "by friday",
+        "finish",
+        "complete",
+        "fix",
+        "implement",
+        "test ",
+        "deploy",
+        "update",
+        "write ",
+        "create ",
+        "prepare ",
+        "schedule ",
+        "regain access",
+    ]
+    return any(c in lower for c in cues)
+
+
+def _regex_extract_from_sentence(s: str) -> Optional[str]:
+    """
+    Try to slice out the 'action' piece from a sentence using regex.
+    If nothing matches, returns the original sentence trimmed.
+    """
+    patterns = [
+        r"(?:I|we|you|they)(?:'ll| will)\s+([^.!?]+)",
+        r"(?:will|should|need to|must|have to|going to)\s+([^.!?]+)",
+        r"(?:please|let's)\s+([^.!?]+)",
+        r"action item[s]?:\s*([^.!?]+)",
+        r"to-?do[s]?:\s*([^.!?]+)",
+    ]
+
+    for pat in patterns:
+        m = re.search(pat, s, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+
+    # Fallback
+    return s.strip()
+
+
+def _speaker_name_for_segment(
+    seg: Dict[str, Any], participants: Optional[Dict[str, Any]]
+) -> str:
+    """
+    Map diarized speaker_id -> canonical human name if possible.
+    """
+    if not participants:
+        return seg.get("speaker_id") or seg.get("speaker") or "Unknown speaker"
+
+    speaker_to_person = participants.get("speaker_to_person", {}) or {}
+    person_to_name = participants.get("person_to_name", {}) or {}
+
+    # Also allow retrieving canonical_name from participants list as fallback
+    participants_list = participants.get("participants") or participants.get(
+        "participants_fused"
+    ) or []
+    pid_to_canonical = {
+        p.get("participant_id"): p.get("canonical_name")
+        for p in participants_list
+        if p.get("participant_id")
+    }
+
+    sid = seg.get("speaker_id") or seg.get("speaker")
+    if not sid:
+        return "Unknown speaker"
+
+    pid = speaker_to_person.get(sid)
+    if not pid:
+        # No mapping from diarization -> face -> person
+        return sid
+
+    name = person_to_name.get(pid) or pid_to_canonical.get(pid)
+    return name or pid or sid
+
+
+def _extract_actions_speaker_aware(
+    transcript: str,
+    speaker_segments: Optional[List[Dict[str, Any]]],
+    participants: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Extract action items using diarized speaker segments + zero-shot classification.
+    This is the 'smart' path that can attach assignees reliably.
+    """
+    if not speaker_segments:
+        return []
+
+    classifier = _get_zs_classifier()
+
+    # 1) Collect candidate segments that *might* contain actions
+    candidate_segments: List[Dict[str, Any]] = []
+    candidate_texts: List[str] = []
+
+    for seg in speaker_segments:
+        text = (seg.get("text") or "").strip()
+        if len(text) < 20:
+            continue
+        if _is_noise_sentence(text):
+            continue
+        if not _has_action_cue(text):
+            continue
+
+        candidate_segments.append(seg)
+        candidate_texts.append(text)
+
+    if not candidate_segments:
+        return []
+
+    # 2) Run zero-shot on batch of candidate segment texts
+    labels = ["action", "decision", "blocker", "other"]
+    zs_results = classifier(candidate_texts, candidate_labels=labels, multi_label=False)
+
+    if isinstance(zs_results, dict):
+        zs_results = [zs_results]
+
+    action_items: List[Dict[str, Any]] = []
+    seen = set()
+
+    for seg, res in zip(candidate_segments, zs_results):
+        top_label = res["labels"][0]
+        top_score = float(res["scores"][0])
+
+        if top_label not in ("action", "decision", "blocker") or top_score < 0.6:
+            continue
+
+        full_sent = (seg.get("text") or "").strip()
+        action_text = _regex_extract_from_sentence(full_sent)
+
+        # discard useless / too short after slicing
+        if len(action_text) < 10:
+            continue
+
+        if _is_noise_sentence(action_text):
+            continue
+
+        assignee = _speaker_name_for_segment(seg, participants)
+
+        key = (action_text.lower(), assignee.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+
+        action_items.append(
+            {
+                "action": action_text,
+                "role": top_label,  # "action" | "decision" | "blocker"
+                "confidence": round(top_score, 3),
+                "assignee": assignee,
+                "speaker_id": seg.get("speaker_id") or seg.get("speaker"),
+                "start": seg.get("start", 0.0),
+                "end": seg.get("end", 0.0),
+            }
+        )
+
+    return action_items
+
+
+def _extract_actions_regex_only(transcript: str) -> List[Dict[str, Any]]:
+    """
+    Fallback: regex-based action extraction with no assignees.
+    This is essentially your previous behaviour.
+    """
+    transcript = (transcript or "").strip()
+    if not transcript:
+        return []
+
+    action_items: List[Dict[str, Any]] = []
+
+    patterns = [
+        r"(?:will|should|need to|must|have to|going to)\s+([^.!?]+)",
+        r"action item[s]?:\s*([^.!?]+)",
+        r"to-?do[s]?:\s*([^.!?]+)",
+        r"(?:please|let's)\s+([^.!?]+)",
+        r"(?:I|we|you|they)(?:'ll| will)\s+([^.!?]+)",
+    ]
+
+    for pattern in patterns:
+        matches = re.finditer(pattern, transcript, re.IGNORECASE)
+        for match in matches:
+            action_text = match.group(1).strip()
+            if not (10 < len(action_text) < 200):
+                continue
+
+            lower = action_text.lower()
+            if any(k in lower for k in _NOISE_KEYWORDS):
+                continue
+
+            # Require at least one "work-like" verb
+            if not re.search(
+                r"\b("
+                r"build|fix|finish|implement|test|deploy|create|update|review|prepare|"
+                r"send|schedule|refactor|write|design|discuss|analyze|monitor|complete|done"
+                r")\b",
+                lower,
+            ):
+                if not re.search(r"\b(done|complete|before)\b", lower):
+                    continue
 
             action_items.append(
                 {
                     "action": action_text,
-                    "confidence": "medium",
-                    "assignee": assignee,
+                    "role": "action",
+                    "confidence": 0.5,
+                    "assignee": None,
                 }
             )
 
-    # Remove duplicates (case-insensitive on action text)
+    # deduplicate
+    seen = set()
+    unique: List[Dict[str, Any]] = []
+    for item in action_items:
+        key = (item["action"].lower(), item.get("assignee") or "")
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+
+    return unique
+
+
+# -------------------------------------------------------------------
+# Action items extraction (regex + speaker/participant linking)
+# -------------------------------------------------------------------
+
+def extract_action_items(
+    transcript: str,
+    speaker_segments: Optional[List[Dict[str, Any]]] = None,
+    participants: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Extract action items and tasks from meeting transcript.
+
+    Improvements:
+    - Still uses regex + heuristics to find "task-like" phrases.
+    - If speaker-labeled segments are provided, we:
+        * look for actions inside each speaker's text
+        * map speaker_id -> person_id -> canonical_name
+        * attach assignee info to each action
+    - Falls back to transcript-only extraction if no segments are available.
+
+    Returns a list of dicts:
+      {
+        "action": str,
+        "assignee": Optional[str],   # canonical participant name if known
+        "speaker_id": Optional[str], # e.g. "SPEAKER_00"
+        "person_id": Optional[str],  # e.g. "PERSON_1"
+        "confidence": "high" | "medium"
+      }
+    """
+    print("Extracting action items...")
+
+    transcript = (transcript or "").strip()
+    if not transcript:
+        return []
+
+    action_items: List[Dict[str, Any]] = []
+
+    # Common action phrases (unchanged core idea)
+    action_patterns = [
+        r"(?:will|should|need to|must|have to|going to)\s+([^.!?]+)",
+        r"action item[s]?:\s*([^.!?]+)",
+        r"to-?do[s]?:\s*([^.!?]+)",
+        r"(?:please|let's)\s+([^.!?]+)",
+        r"(?:I|we|you|they)(?:'ll| will)\s+([^.!?]+)",
+    ]
+
+    # Precompute mapping: speaker_id -> (person_id, canonical_name)
+    speaker_to_person = {}
+    person_to_name = {}
+
+    if participants:
+        speaker_to_person = participants.get("speaker_to_person", {}) or {}
+        person_to_name = participants.get("person_to_name", {}) or {}
+
+    def _add_action_item(action_text: str, speaker_id: Optional[str]) -> None:
+        """Internal helper to filter and append an action item."""
+        # Clean & basic length checks
+        action_text = action_text.strip()
+        if not (10 < len(action_text) < 200):
+            return
+
+        lower = action_text.lower()
+
+        # Drop noisy / non-business actions
+        if any(k in lower for k in _NOISE_KEYWORDS):
+            return
+
+        # Require at least one "work-like" verb
+        if not re.search(
+            r"\b("
+            r"build|fix|finish|implement|test|deploy|create|update|review|prepare|"
+            r"send|schedule|refactor|write|design|discuss|analyze|monitor|complete|"
+            r"done|learn|study|improve|optimize"
+            r")\b",
+            lower,
+        ):
+            # still keep some generic phrases like "be done before Friday"
+            if not re.search(r"\b(done|complete|before)\b", lower):
+                return
+
+        # -------------------------
+        # Assignee inference
+        # -------------------------
+        person_id: Optional[str] = None
+        assignee_name: Optional[str] = None
+
+        if speaker_id is not None:
+            sid_str = str(speaker_id)
+            pid = speaker_to_person.get(sid_str)
+            if pid:
+                person_id = pid
+                assignee_name = person_to_name.get(pid)
+
+        confidence = "high" if assignee_name else "medium"
+
+        action_items.append(
+            {
+                "action": action_text,
+                "assignee": assignee_name,
+                "speaker_id": str(speaker_id) if speaker_id is not None else None,
+                "person_id": person_id,
+                "confidence": confidence,
+            }
+        )
+
+    # ------------------------------------------------------
+    # Mode 1 — Use speaker-labeled segments (preferred)
+    # ------------------------------------------------------
+    if speaker_segments:
+        for seg in speaker_segments:
+            seg_text = (seg.get("text") or "").strip()
+            if not seg_text:
+                continue
+
+            speaker_id = seg.get("speaker_id") or seg.get("speaker")
+
+            for pattern in action_patterns:
+                for match in re.finditer(pattern, seg_text, re.IGNORECASE):
+                    action_text = match.group(1).strip()
+                    _add_action_item(action_text, speaker_id)
+
+    # ------------------------------------------------------
+    # Mode 2 — Fallback: global regex over full transcript
+    # ------------------------------------------------------
+    else:
+        for pattern in action_patterns:
+            for match in re.finditer(pattern, transcript, re.IGNORECASE):
+                action_text = match.group(1).strip()
+                _add_action_item(action_text, None)
+
+    # ------------------------------------------------------
+    # De-duplicate while preserving order
+    # ------------------------------------------------------
     seen = set()
     unique_actions: List[Dict[str, Any]] = []
     for item in action_items:
-        key = item["action"].lower()
+        key = (
+            (item["action"] or "").lower(),
+            item.get("assignee") or "",
+            item.get("speaker_id") or "",
+        )
         if key not in seen:
             seen.add(key)
             unique_actions.append(item)
 
     result = unique_actions[:15]
-    print(f"✓ Extracted {len(result)} action items")
+    assigned_count = sum(1 for a in result if a.get("assignee"))
+    print(
+        f"✓ Extracted {len(result)} action items"
+        + (f" ({assigned_count} with assignee)" if result else "")
+    )
     return result
+
