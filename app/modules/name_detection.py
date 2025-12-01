@@ -8,7 +8,7 @@ import spacy
 import string
 from collections import Counter, defaultdict
 
-# Try to load spacy model for NER
+# Try to load spaCy model for NER
 try:
     nlp = spacy.load("en_core_web_sm")
 except Exception:
@@ -89,7 +89,6 @@ def _looks_like_name_token(token: str) -> bool:
     if not t:
         return False
 
-    # slightly stricter: avoid super-short junk tokens
     if len(t) < 3 or len(t) > 20:
         return False
 
@@ -121,25 +120,98 @@ def _clean_name_string(name: str) -> str:
 
 
 # -------------------------------------------------------------------
-# 1) Global OCR-based name extraction (fallback / legacy)
+# Plausible full-name check
 # -------------------------------------------------------------------
+
+def _is_plausible_name(candidate: str) -> bool:
+    """
+    Stricter check for a full name string (1–3 tokens).
+    Used AFTER we've assembled a candidate like 'Adi Raje'.
+    """
+    candidate = _clean_name_string(candidate)
+    if not candidate:
+        return False
+
+    parts = candidate.split()
+
+    # 1–3 tokens: ['Adi'], ['Adi', 'Raje'], ['Adi', 'van', 'Something']
+    if not (1 <= len(parts) <= 3):
+        return False
+
+    # total alphabetic length (no spaces) – avoid 3–4 letter junk like 'Ul Oe'
+    total_len = len("".join(parts))
+    if total_len < 5:
+        return False
+
+    # each word at least 3 chars – filters 'Ul', 'At', etc.
+    if any(len(p) < 3 for p in parts):
+        return False
+
+    # reuse bad token filters
+    if any(p in _BAD_TOKENS for p in parts):
+        return False
+    if any(p in _NON_NAME_SINGLE_WORDS for p in parts):
+        return False
+
+    return True
+
+
+# ============================================================
+# TESSERACT OCR RUNNER (single place)
+# ============================================================
+
+def _run_tesseract_ocr(roi_gray):
+    """
+    Input: grayscale ROI
+    Output: list of raw strings (tokens / fragments) from OCR
+    """
+    texts = []
+
+    data = pytesseract.image_to_data(
+        roi_gray,
+        output_type=Output.DICT,
+        config="--oem 3 --psm 7",
+    )
+
+    t_texts = data.get("text", [])
+    confs = data.get("conf", [])
+    for i, raw in enumerate(t_texts):
+        txt = (raw or "").strip()
+        if not txt or len(txt) <= 1:
+            continue
+
+        # try to parse confidence
+        try:
+            c = int(float(confs[i]))
+        except Exception:
+            c = -1
+
+        # slightly tolerant, we clean later
+        if c < 60:
+            continue
+
+        texts.append(txt)
+
+    return texts
+
+
+# ====================================================================
+# 1) Global OCR-based name extraction (bottom overlay band)
+# ====================================================================
 
 def extract_names_from_video(
     video_path: str,
-    fps: int = 2,
+    fps: int = 3,                 # sample a bit more often
     max_seconds: int = 180,
-    bottom_fraction: float = 0.4,
+    bottom_fraction: float = 0.5, # slightly taller bottom band
 ):
     """
     Extract participant name tags using OCR from the bottom portion
     of the frame.
 
-    This is kept as a generic fallback for when face tracks are not available.
     Returns: list of dicts [{ "timestamp": float, "name": str }, ...]
     """
     print("Extracting names from video overlay (global band)...")
-
-    MIN_CONF = 70  # minimum per-word confidence
 
     try:
         cap = cv2.VideoCapture(video_path)
@@ -172,7 +244,7 @@ def extract_names_from_video(
                 roi = gray[start_row:, :]
 
                 # Upscale + enhance contrast for better small-text OCR
-                scale_factor = 2.0
+                scale_factor = 2.5
                 roi_large = cv2.resize(
                     roi,
                     None,
@@ -186,51 +258,29 @@ def extract_names_from_video(
                 frame_names = []
 
                 try:
-                    data = pytesseract.image_to_data(
-                        roi_large,
-                        output_type=Output.DICT,
-                        config="--oem 3 --psm 7",
-                    )
+                    raw_tokens = _run_tesseract_ocr(roi_large)
 
-                    texts = data.get("text", [])
-                    confs = data.get("conf", [])
-                    tokens = []
-
-                    # Build (token, conf) pairs
-                    for i, raw in enumerate(texts):
-                        txt = (raw or "").strip()
-                        if not txt or len(txt) <= 1:
-                            continue
-                        try:
-                            conf_i = int(float(confs[i]))
-                        except Exception:
-                            conf_i = -1
-                        if conf_i < MIN_CONF:
-                            continue
-                        tokens.append((txt, conf_i))
-
-                    # Clean punctuation
-                    cleaned = [
-                        (t.strip(string.punctuation + " "), c)
-                        for (t, c) in tokens
+                    # Try to assemble tokens into names
+                    cleaned_tokens = [
+                        t.strip(string.punctuation + " ")
+                        for t in raw_tokens
+                        if t.strip()
                     ]
 
                     i = 0
-                    while i < len(cleaned):
-                        t1, c1 = cleaned[i]
+                    while i < len(cleaned_tokens):
+                        t1 = cleaned_tokens[i]
                         if not _looks_like_name_token(t1):
                             i += 1
                             continue
 
                         candidate = None
-                        cand_conf = c1
 
-                        if i + 1 < len(cleaned):
-                            t2, c2 = cleaned[i + 1]
+                        if i + 1 < len(cleaned_tokens):
+                            t2 = cleaned_tokens[i + 1]
                             # Try to form "First Last"
                             if _looks_like_name_token(t2):
                                 candidate = f"{t1} {t2}"
-                                cand_conf = min(c1, c2)
                                 i += 2
                             else:
                                 candidate = t1
@@ -238,9 +288,6 @@ def extract_names_from_video(
                         else:
                             candidate = t1
                             i += 1
-
-                        if cand_conf < MIN_CONF:
-                            continue
 
                         candidate = _clean_name_string(candidate)
                         if not _is_plausible_name(candidate):
@@ -268,7 +315,8 @@ def extract_names_from_video(
 
         counter = Counter(all_name_tokens)
 
-        MIN_OCCURRENCE = 1  # you can raise this later for more strictness
+        # For now keep even single occurrences; higher threshold is possible later
+        MIN_OCCURRENCE = 1
         stable_names = {n for n, c in counter.items() if c >= MIN_OCCURRENCE}
 
         results = []
@@ -289,34 +337,29 @@ def extract_names_from_video(
         return []
 
 
-# -------------------------------------------------------------------
-# 1b) Per-face OCR using face tracks (robust multi-person solution)
-# -------------------------------------------------------------------
+# ====================================================================
+# 2) Per-face OCR using face tracks (robust multi-person solution)
+# ====================================================================
 
 def extract_names_for_tracks(
     video_path: str,
     face_tracks: list,
-    max_samples_per_person: int = 25,
+    max_samples_per_person: int = 35,
 ):
     """
-    Extract participant names by OCR'ing a label band around/below each
-    tracked face bounding box.
+    Extract participant names by OCR'ing a label strip
+    just BELOW each tracked face bounding box.
 
-    This is more robust for multi-person meetings:
+    More robust for multi-person meetings:
       - works for faces in any row/column of the grid
       - ties candidate names to real face tracks (PERSON_0, PERSON_1, ...)
 
     Returns a list of dicts:
       [{ "timestamp": float, "name": str }, ...]
-
-    (We let identity_fusion() map these back to person_ids via timestamp,
-     as before, so this is drop-in compatible with the existing pipeline.)
     """
     print("Extracting names from video using face tracks...")
 
-    MIN_CONF = 70  # minimum per-word confidence
-
-    # If we somehow have no tracks, fall back to the old global method.
+    # If we somehow have no tracks, fall back to the global method.
     if not face_tracks:
         print("⚠ No face tracks available, falling back to global OCR")
         return extract_names_from_video(video_path)
@@ -340,6 +383,7 @@ def extract_names_for_tracks(
         results = []
 
         for pid, tracks in tracks_by_pid.items():
+            # sort by time
             tracks = sorted(tracks, key=lambda x: float(x.get("timestamp", 0.0) or 0.0))
             if not tracks:
                 continue
@@ -372,28 +416,25 @@ def extract_names_for_tracks(
                 bw = max(1, min(bw, w - x))
                 bh = max(1, min(bh, h - y))
 
-                # --- Wider & taller "label band" around/below the face ---
-                # We use a generous vertical band that starts slightly below
-                # mid-face and extends to ~2x face height below the top.
-                label_top = y + int(0.3 * bh)         # a bit below the face center
-                label_bottom = y + int(2.0 * bh)      # down to ~2x face height
+                # Label strip below the face:
+                #   start a bit below the chin, and go down up to ~2x face height
+                label_top = y + int(bh * 0.6)
+                label_bottom = y + int(bh * 2.0)
 
                 label_top = max(0, min(label_top, h - 2))
                 label_bottom = max(label_top + 1, min(label_bottom, h))
 
-                # Make the band significantly wider than the face:
-                # one face-width to the left and two to the right
-                x1 = max(0, int(x - 1.0 * bw))
-                x2 = min(w, int(x + 2.0 * bw))
+                x1 = max(0, int(x - bw * 0.3))
+                x2 = min(w, int(x + bw * 1.3))
 
-                if x2 <= x1 or label_bottom <= label_top:
+                if label_bottom <= label_top or x2 <= x1:
                     continue
 
                 roi = frame[label_top:label_bottom, x1:x2]
                 gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
                 # Upscale & enhance
-                scale_factor = 2.0
+                scale_factor = 2.5
                 roi_large = cv2.resize(
                     gray,
                     None,
@@ -406,48 +447,26 @@ def extract_names_for_tracks(
 
                 frame_names = []
                 try:
-                    data = pytesseract.image_to_data(
-                        roi_large,
-                        output_type=Output.DICT,
-                        config="--oem 3 --psm 7",  # single-line text mode
-                    )
-
-                    texts = data.get("text", [])
-                    confs = data.get("conf", [])
-                    tokens = []
-
-                    for i, raw in enumerate(texts):
-                        txt = (raw or "").strip()
-                        if not txt or len(txt) <= 1:
-                            continue
-                        try:
-                            conf_i = int(float(confs[i]))
-                        except Exception:
-                            conf_i = -1
-                        if conf_i < MIN_CONF:
-                            continue
-                        tokens.append((txt, conf_i))
-
-                    cleaned = [
-                        (t.strip(string.punctuation + " "), c)
-                        for (t, c) in tokens
+                    raw_tokens = _run_tesseract_ocr(roi_large)
+                    cleaned_tokens = [
+                        t.strip(string.punctuation + " ")
+                        for t in raw_tokens
+                        if t.strip()
                     ]
 
                     i = 0
-                    while i < len(cleaned):
-                        t1, c1 = cleaned[i]
+                    while i < len(cleaned_tokens):
+                        t1 = cleaned_tokens[i]
                         if not _looks_like_name_token(t1):
                             i += 1
                             continue
 
                         candidate = None
-                        cand_conf = c1
 
-                        if i + 1 < len(cleaned):
-                            t2, c2 = cleaned[i + 1]
+                        if i + 1 < len(cleaned_tokens):
+                            t2 = cleaned_tokens[i + 1]
                             if _looks_like_name_token(t2):
                                 candidate = f"{t1} {t2}"
-                                cand_conf = min(c1, c2)
                                 i += 2
                             else:
                                 candidate = t1
@@ -455,9 +474,6 @@ def extract_names_for_tracks(
                         else:
                             candidate = t1
                             i += 1
-
-                        if cand_conf < MIN_CONF:
-                            continue
 
                         candidate = _clean_name_string(candidate)
                         if not _is_plausible_name(candidate):
@@ -488,49 +504,13 @@ def extract_names_for_tracks(
 
     except Exception as e:
         print(f"✗ Per-face name extraction error: {e}")
+        # Fallback to global band if per-face fails
         return extract_names_from_video(video_path)
 
 
-# -------------------------------------------------------------------
-# 2) Plausible name detection (post-assembly)
-# -------------------------------------------------------------------
-
-def _is_plausible_name(candidate: str) -> bool:
-    """
-    Stricter check for a full name string (1–3 tokens).
-    Used AFTER we've assembled a candidate like 'Adi Raje'.
-    """
-    candidate = _clean_name_string(candidate)
-    if not candidate:
-        return False
-
-    parts = candidate.split()
-
-    # 1–3 tokens: ['Adi'], ['Adi', 'Raje'], ['Adi', 'van', 'Something']
-    if not (1 <= len(parts) <= 3):
-        return False
-
-    # total alphabetic length (no spaces) – avoid 3–4 letter junk like 'Ul Oe'
-    total_len = len("".join(parts))
-    if total_len < 5:
-        return False
-
-    # each word at least 3 chars – filters 'Ul', 'At', etc.
-    if any(len(p) < 3 for p in parts):
-        return False
-
-    # reuse existing bad token filters
-    if any(p in _BAD_TOKENS for p in parts):
-        return False
-    if any(p in _NON_NAME_SINGLE_WORDS for p in parts):
-        return False
-
-    return True
-
-
-# -------------------------------------------------------------------
+# ====================================================================
 # 3) Name detection from transcript (NER + heuristics)
-# -------------------------------------------------------------------
+# ====================================================================
 
 def detect_participant_names(transcript: str):
     """

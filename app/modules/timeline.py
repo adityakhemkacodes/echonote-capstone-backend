@@ -1,183 +1,16 @@
+# app/modules/timeline.py
+
 from typing import List, Dict, Any, Optional
-from collections import defaultdict
-import math
+from collections import Counter, defaultdict
 
-# -------------------------------------------------------------------
-# Helpers
-# -------------------------------------------------------------------
-
-def _group_emotions_by_person(emotions_timeline: List[Dict[str, Any]]):
-    """
-    Group facial emotion samples by person_id.
-    Each entry in emotions_timeline is expected to look like:
-      { "timestamp": float, "emotion": "neutral", "person_id": "PERSON_1", ... }
-    """
-    by_person = defaultdict(list)
-    for e in emotions_timeline or []:
-        ts = float(e.get("timestamp", 0.0) or 0.0)
-        emo = e.get("emotion") or "neutral"
-        pid = e.get("person_id") or "UNKNOWN"
-        by_person[pid].append((ts, emo))
-
-    # sort each person's samples by time
-    for pid in by_person:
-        by_person[pid].sort(key=lambda x: x[0])
-
-    return by_person
+NEGATIVE_EMOTIONS = {"sad", "angry", "fear", "disgust"}
 
 
-def _build_streaks(samples, min_duration: float):
-    """
-    Compress (timestamp, emotion) samples into streaks:
-      [{ "start": .., "end": .., "emotion": "happy", "duration": .. }, ...]
-    A streak is a run of the same emotion.
-    Very short streaks (< min_duration) are kept but marked so we can
-    ignore them when detecting mood changes.
-    """
-    if not samples:
-        return []
+def _most_common(items: List[str]) -> Optional[str]:
+    if not items:
+        return None
+    return Counter(items).most_common(1)[0][0]
 
-    streaks = []
-    cur_emo = samples[0][1]
-    start_ts = samples[0][0]
-    last_ts = start_ts
-
-    for ts, emo in samples[1:]:
-        if emo == cur_emo:
-            last_ts = ts
-            continue
-
-        duration = max(0.01, last_ts - start_ts)
-        streaks.append(
-            {
-                "start": start_ts,
-                "end": last_ts,
-                "emotion": cur_emo,
-                "duration": duration,
-                "is_short": duration < min_duration,
-            }
-        )
-
-        # start new streak
-        cur_emo = emo
-        start_ts = ts
-        last_ts = ts
-
-    # final streak
-    duration = max(0.01, last_ts - start_ts)
-    streaks.append(
-        {
-            "start": start_ts,
-            "end": last_ts,
-            "emotion": cur_emo,
-            "duration": duration,
-            "is_short": duration < min_duration,
-        }
-    )
-
-    return streaks
-
-
-def _find_speaker_at_time(
-    speaker_segments: List[Dict[str, Any]],
-    t: float,
-) -> Optional[str]:
-    """
-    Find diarized speaker id active at time t.
-    """
-    for seg in speaker_segments or []:
-        s = float(seg.get("start", 0.0) or 0.0)
-        e = float(seg.get("end", s) or s)
-        if s <= t <= e:
-            return seg.get("speaker")
-    return None
-
-
-def _extract_context_snippet(
-    labeled_segments: List[Dict[str, Any]],
-    t: float,
-    window: float = 6.0,
-    max_chars: int = 140,
-) -> Dict[str, Any]:
-    """
-    Extract a small text snippet around time t from speaker-labeled
-    transcript segments.
-
-    Returns:
-      { "snippet": str, "speaker_id": Optional[str] }
-    """
-    if not labeled_segments:
-        return {"snippet": "", "speaker_id": None}
-
-    # Collect segments that overlap [t - window, t + window]
-    start_window = t - window
-    end_window = t + window
-
-    candidates = []
-    for seg in labeled_segments:
-        s = float(seg.get("start", 0.0) or 0.0)
-        e = float(seg.get("end", s) or s)
-        if e < start_window or s > end_window:
-            continue
-        candidates.append(seg)
-
-    if not candidates:
-        return {"snippet": "", "speaker_id": None}
-
-    # Sort by time and concatenate text until we hit max_chars
-    candidates.sort(key=lambda s: float(s.get("start", 0.0) or 0.0))
-    full = []
-    speaker_votes = defaultdict(int)
-
-    for seg in candidates:
-        text = (seg.get("text") or "").strip()
-        if not text:
-            continue
-        full.append(text)
-        speaker_id = seg.get("speaker_id")
-        if speaker_id:
-            speaker_votes[speaker_id] += 1
-
-    if not full:
-        return {"snippet": "", "speaker_id": None}
-
-    joined = " ".join(full)
-    if len(joined) > max_chars:
-        joined = joined[: max_chars - 3].rstrip() + "..."
-
-    # Pick the speaker that appears most in these segments
-    speaker_id = None
-    if speaker_votes:
-        speaker_id = max(speaker_votes.items(), key=lambda x: x[1])[0]
-
-    return {"snippet": joined, "speaker_id": speaker_id}
-
-
-def _infer_context_type(snippet: str) -> Optional[str]:
-    """
-    Very simple heuristic to label the context:
-      - 'joke / small talk'
-      - 'issue / blocker'
-      - 'decision / planning'
-      - None
-    """
-    s = snippet.lower()
-
-    if any(k in s for k in ["haha", "laugh", "joke", "lol", "pizza", "sushi", "coffee", "cat", "mascot"]):
-        return "joke / small talk"
-
-    if any(k in s for k in ["blocker", "problem", "issue", "error", "bug", "doesn't work", "locked", "crash"]):
-        return "issue / blocker"
-
-    if any(k in s for k in ["decided", "we decided", "we agreed", "decision", "choose", "go with", "plan", "roadmap"]):
-        return "decision / planning"
-
-    return None
-
-
-# -------------------------------------------------------------------
-# Public API
-# -------------------------------------------------------------------
 
 def detect_mood_changes(
     facial_sentiment: Dict[str, Any],
@@ -185,109 +18,191 @@ def detect_mood_changes(
     speaker_segments: List[Dict[str, Any]],
     speaker_labeled_segments: Optional[List[Dict[str, Any]]] = None,
     speaker_to_person: Optional[Dict[str, str]] = None,
-    min_streak_duration: float = 4.0,
-    min_gap_seconds: float = 10.0,
-    max_changes: int = 8,
+    person_to_name: Optional[Dict[str, str]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Detect *meaningful* mood changes from facial sentiment, with:
-      - smoothing via emotion streaks
-      - ignoring very short blips
-      - enforcing a minimum time gap between reported changes
-      - attaching person_id, speaker_id, and a short context snippet.
+    Detect meaningful mood changes from the facial emotion timeline, with:
+      - per-person smoothing
+      - ignoring spurious negative states (rare 'sad/angry' blips)
+      - minimum time gap between reported changes
+      - optional context snippet & speaker name
 
-    Returns a list of dicts:
+    Returns a list of:
       {
         "timestamp": float,
-        "from_emotion": "neutral",
-        "to_emotion": "happy",
         "person_id": "PERSON_1",
         "speaker_id": "SPEAKER_00" | None,
-        "context_snippet": "...",
-        "context_type": "joke / small talk" | "issue / blocker" | ... | None,
+        "speaker_name": "Aditya Khemka" | None,
+        "from": "neutral",
+        "to": "happy",
+        "context": "short text snippet around that time",
         "impact_score": float,
       }
     """
-    emotions_timeline = (facial_sentiment or {}).get("emotions_timeline", []) or []
-    if not emotions_timeline:
+
+    events = facial_sentiment.get("emotions_timeline", []) or []
+    if not events:
         return []
 
+    # Group events per person, sorted by time
+    per_person = defaultdict(list)
+    for e in events:
+        pid = e.get("person_id")
+        ts = float(e.get("timestamp", 0.0) or 0.0)
+        emo = (e.get("emotion") or "neutral").lower()
+        if not pid:
+            continue
+        per_person[pid].append({"timestamp": ts, "emotion": emo})
+
+    for pid in per_person:
+        per_person[pid].sort(key=lambda x: x["timestamp"])
+
+    # Pre-compute emotion frequency per person to detect rare negative states
+    per_person_counts = {}
+    for pid, seq in per_person.items():
+        counts = Counter(e["emotion"] for e in seq)
+        per_person_counts[pid] = counts
+
+    mood_changes: List[Dict[str, Any]] = []
+
+    # Helper: find a speaker segment + text snippet around a timestamp for a given person
+    speaker_labeled_segments = speaker_labeled_segments or []
     speaker_to_person = speaker_to_person or {}
+    person_to_name = person_to_name or {}
 
-    by_person = _group_emotions_by_person(emotions_timeline)
-    changes: List[Dict[str, Any]] = []
+    # Reverse mapping: person_id -> list of speaker_ids
+    person_to_speakers = defaultdict(list)
+    for sid, pid in speaker_to_person.items():
+        person_to_speakers[pid].append(sid)
 
-    for pid, samples in by_person.items():
-        streaks = _build_streaks(samples, min_streak_duration)
-        if len(streaks) < 2:
+    def find_context_for(pid: str, ts: float):
+        """Return (speaker_id, speaker_name, snippet) for this person around ts."""
+        speaker_ids = person_to_speakers.get(pid, [])
+        best_seg = None
+        best_overlap = 0.0
+        best_sid = None
+
+        for seg in speaker_labeled_segments:
+            sid = seg.get("speaker_id")
+            if speaker_ids and sid not in speaker_ids:
+                continue
+
+            s_start = float(seg.get("start", 0.0) or 0.0)
+            s_end = float(seg.get("end", s_start) or s_start)
+            if s_end <= s_start:
+                continue
+
+            # compute how much ts lies in this segment
+            if s_start <= ts <= s_end:
+                overlap = s_end - s_start
+            else:
+                # penalise off-by-a-bit segments
+                overlap = max(0.0, min(ts, s_end) - max(ts, s_start))
+
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_seg = seg
+                best_sid = sid
+
+        snippet = None
+        if best_seg:
+            text = (best_seg.get("text") or "").strip()
+            # Shorten snippet if very long
+            if len(text) > 140:
+                snippet = text[:137].rstrip() + "..."
+            else:
+                snippet = text
+
+        speaker_name = None
+        if best_sid and best_sid in speaker_to_person:
+            p = speaker_to_person[best_sid]
+            speaker_name = person_to_name.get(p)
+
+        return best_sid, speaker_name, snippet
+
+    # Parameters to control sensitivity
+    WINDOW_SIZE = 3       # number of recent states for smoothing
+    MIN_GAP_SEC = 6.0     # minimum seconds between reported changes per person
+    NEG_SHARE_THRESHOLD = 0.10  # ignore negative emotions if they are < 10% of this person's frames
+
+    for pid, seq in per_person.items():
+        if not seq:
             continue
 
-        last_change_time = -1e9
+        counts = per_person_counts[pid]
+        total = sum(counts.values()) or 1
+        allowed_negative = {
+            emo
+            for emo, c in counts.items()
+            if emo in NEGATIVE_EMOTIONS and (c / total) >= NEG_SHARE_THRESHOLD
+        }
 
-        for i in range(1, len(streaks)):
-            prev_s = streaks[i - 1]
-            curr_s = streaks[i]
+        history = []  # recent raw emotions for smoothing
+        prev_state = "neutral"
+        last_change_ts = None
 
-            if prev_s["emotion"] == curr_s["emotion"]:
+        for e in seq:
+            ts = e["timestamp"]
+            emo = e["emotion"]
+
+            # Map very rare negative emotions back to neutral (noise)
+            if emo in NEGATIVE_EMOTIONS and emo not in allowed_negative:
+                emo = "neutral"
+
+            history.append(emo)
+            if len(history) > WINDOW_SIZE:
+                history.pop(0)
+
+            smoothed = _most_common(history) or emo
+
+            # Only consider changes away from previous smoothed state
+            if smoothed == prev_state:
                 continue
-            
-            if curr_s["emotion"] == "neutral":
+
+            # Ignore transitions TO neutral – we only care when mood goes
+            # from neutral -> something else or happy -> sad, etc.
+            if smoothed == "neutral":
+                prev_state = smoothed
                 continue
 
-            # Require new emotion to be a reasonably long streak
-            if curr_s["duration"] < min_streak_duration:
+            # Enforce minimum time gap between reported changes
+            if last_change_ts is not None and (ts - last_change_ts) < MIN_GAP_SEC:
+                prev_state = smoothed
                 continue
 
-            change_time = curr_s["start"]
+            # At this point, we accept this as a "real" mood change
+            sid, speaker_name, snippet = find_context_for(pid, ts)
 
-            # Enforce minimum gap between reported changes for this person
-            if change_time - last_change_time < min_gap_seconds:
-                continue
+            # Crude impact score:
+            #  - negative emotions a bit higher than positive ones
+            #  - slight boost if we have a context snippet
+            base_impact = 0.7
+            if smoothed in NEGATIVE_EMOTIONS:
+                base_impact = 0.9
+            elif smoothed == "happy":
+                base_impact = 0.8
 
-            last_change_time = change_time
+            if snippet:
+                base_impact += 0.05
 
-            # Attach context snippet + speaker
-            ctx = _extract_context_snippet(
-                speaker_labeled_segments or [],
-                change_time,
-                window=6.0,
-                max_chars=160,
-            )
-            snippet = ctx["snippet"]
-            speaker_id = ctx["speaker_id"]
+            change = {
+                "timestamp": round(ts, 2),
+                "person_id": pid,
+                "speaker_id": sid,
+                "speaker_name": speaker_name,
+                "from": prev_state,
+                "to": smoothed,
+                "context": snippet,
+                "impact_score": round(base_impact, 3),
+            }
+            mood_changes.append(change)
 
-            # If diarization segments are also provided, fall back to them
-            # to determine speaker when snippet didn't give us one.
-            if speaker_id is None:
-                speaker_id = _find_speaker_at_time(speaker_segments, change_time)
+            prev_state = smoothed
+            last_change_ts = ts
 
-            # Try to infer a coarse context type (joke / blocker / decision)
-            context_type = _infer_context_type(snippet) if snippet else None
-
-            # Impact score ~ how long the new emotion lasts
-            impact_score = curr_s["duration"]
-
-            changes.append(
-                {
-                    "timestamp": round(change_time, 2),
-                    "from_emotion": prev_s["emotion"],
-                    "to_emotion": curr_s["emotion"],
-                    "person_id": pid,
-                    "speaker_id": speaker_id,
-                    "context_snippet": snippet,
-                    "context_type": context_type,
-                    "impact_score": float(impact_score),
-                }
-            )
-
-    # If we have many changes, keep the most impactful ones,
-    # but sort final result by time for readability.
-    if len(changes) > max_changes:
-        changes.sort(key=lambda c: c["impact_score"], reverse=True)
-        changes = changes[:max_changes]
-
-    changes.sort(key=lambda c: c["timestamp"])
-    return changes
+    # Sort all changes by time
+    mood_changes.sort(key=lambda x: x["timestamp"])
+    return mood_changes
 
 
 def create_timeline(
@@ -296,38 +211,45 @@ def create_timeline(
     face_tracking_data: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """
-    Build a simple combined timeline of speaking segments and mood changes.
+    Build a simple merged timeline of:
+      - speech segments
+      - mood change events
 
-    Each entry is either:
-      - { "type": "speech_segment", "start": .., "end": .., "speaker_id": .. }
-      - { "type": "mood_change", ...same keys as detect_mood_changes(...) }
+    This is primarily for UI / debugging and is trimmed by the processor.
     """
+
     timeline: List[Dict[str, Any]] = []
 
-    # Speech segments
+    # 1) Speaker segments (who spoke when)
     for seg in speaker_segments or []:
-        s = float(seg.get("start", 0.0) or 0.0)
-        e = float(seg.get("end", s) or s)
-        timeline.append(
-            {
-                "type": "speech_segment",
-                "start": s,
-                "end": e,
-                "speaker_id": seg.get("speaker"),
-            }
-        )
-
-    # Mood changes (already have timestamp)
-    for mc in mood_changes or []:
-        entry = dict(mc)
-        entry["type"] = "mood_change"
+        entry = {
+            "type": "speech",
+            "start": float(seg.get("start", 0.0) or 0.0),
+            "end": float(seg.get("end", 0.0) or 0.0),
+            "speaker": seg.get("speaker"),
+        }
         timeline.append(entry)
 
-    # Sort by time (speech segments by start, mood changes by timestamp)
-    def _time_key(item: Dict[str, Any]) -> float:
-        if item.get("type") == "mood_change":
-            return float(item.get("timestamp", 0.0) or 0.0)
-        return float(item.get("start", 0.0) or 0.0)
+    # 2) Mood changes as point events
+    for mc in mood_changes or []:
+        entry = {
+            "type": "mood_change",
+            "timestamp": mc.get("timestamp"),
+            "person_id": mc.get("person_id"),
+            "speaker_id": mc.get("speaker_id"),
+            "speaker_name": mc.get("speaker_name"),
+            "from": mc.get("from"),
+            "to": mc.get("to"),
+            "context": mc.get("context"),
+            "impact_score": mc.get("impact_score", 0.0),
+        }
+        timeline.append(entry)
 
-    timeline.sort(key=_time_key)
+    # Sort combined timeline:
+    def _key(e):
+        if e["type"] == "speech":
+            return e["start"]
+        return e.get("timestamp", 0.0)
+
+    timeline.sort(key=_key)
     return timeline

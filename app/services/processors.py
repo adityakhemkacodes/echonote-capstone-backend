@@ -24,7 +24,7 @@ from app.modules.sentiment import analyze_text_sentiment
 from app.modules.topic_segmentation import segment_topics
 from app.modules.timeline import create_timeline, detect_mood_changes
 from app.modules.summarizer import generate_summary, extract_action_items
-from app.modules.identity_fusion import fuse_identities
+from app.modules.identity_fusion import fuse_identities, _name_similarity
 
 
 class MeetingProcessor:
@@ -84,7 +84,7 @@ class MeetingProcessor:
             self.results["transcription"] = {"error": str(e)}
             return None
 
-    # -------------------------------------------------------------------------
+        # -------------------------------------------------------------------------
     # STEP 2: PARTICIPANTS (FACE TRACKING + NAMES + IDENTITY FUSION)
     # -------------------------------------------------------------------------
     def process_participants(self) -> Optional[Dict[str, Any]]:
@@ -125,34 +125,124 @@ class MeetingProcessor:
             # 6) Entity recognition for additional context
             entities = extract_entities(transcript_text)
 
+            # 6.1) Try to assign transcript-only names to anonymous participants
+            existing_canon = [
+                p["canonical_name"]
+                for p in participants_fused
+                if p.get("canonical_name")
+            ]
+            existing_canon_lower = {c.lower() for c in existing_canon if c}
+
+            # Deduplicate transcript_names while preserving order
+            transcript_names_unique: list[str] = []
+            for n in (transcript_names or []):
+                if not n:
+                    continue
+                if n not in transcript_names_unique:
+                    transcript_names_unique.append(n)
+
+            # Filter transcript names that are not just variants of existing canonicals
+            candidate_text_names: list[str] = []
+            for name in transcript_names_unique:
+                ln = name.strip().lower()
+                is_duplicate = False
+                for ec in existing_canon_lower:
+                    # If it's very similar to an existing canonical, skip (e.g. "Aditya" vs "Aditya Khemka")
+                    if _name_similarity(ln, ec) >= 0.85:
+                        is_duplicate = True
+                        break
+                if not is_duplicate:
+                    candidate_text_names.append(name)
+
+            # Assign candidate transcript names to participants that don't yet have a canonical_name
+            anon_participants = [p for p in participants_fused if not p.get("canonical_name")]
+
+            for p, name in zip(anon_participants, candidate_text_names):
+                p["canonical_name"] = name
+                aliases = p.get("aliases") or []
+                if name not in aliases:
+                    aliases.append(name)
+                p["aliases"] = aliases
+
+            # Refresh person_to_name map with any newly assigned canonical names
+            for p in participants_fused:
+                cname = p.get("canonical_name")
+                if cname:
+                    person_map[p["participant_id"]] = cname
+
             # 7) Build a global "detected names" list for easy display:
-            #    canonical names if available, falling back to any transcript/OCR names
+            #    - Prefer canonical per-person names
+            #    - Also include transcript-based names that aren't just aliases/typos
             canonical_names = [
                 p["canonical_name"]
                 for p in participants_fused
                 if p.get("canonical_name")
             ]
 
-            # Fallback pool of raw names (transcript + OCR)
+            # Raw pool from transcript + OCR
             raw_names = list(set((transcript_names or []) + ocr_name_list))
 
-            # Keep canonical names first, then fill with raw names not already included
-            seen = set()
-            ordered_detected = []
-            for n in canonical_names + raw_names:
+            # Start with canonical names, then extend with raw names that aren't just duplicates
+            base_names: list[str] = []
+            base_names.extend(canonical_names)
+
+            for n in raw_names:
                 if not n:
                     continue
-                key = n.strip().lower()
-                if key not in seen:
-                    seen.add(key)
-                    ordered_detected.append(n)
+                if any(n.strip().lower() == c.strip().lower() for c in canonical_names):
+                    continue
+                base_names.append(n)
+
+            # Deduplicate and avoid alias-y forms like "Aditya", "Khemka", "Khemks"
+            cleaned_detected: list[str] = []
+            seen_lower = set()
+
+            for n in base_names:
+                if not n:
+                    continue
+                n = n.strip()
+                if not n:
+                    continue
+
+                lower_n = n.lower()
+                if lower_n in seen_lower:
+                    continue
+
+                tokens_n = lower_n.split()
+                is_redundant = False
+
+                for existing in cleaned_detected:
+                    le = existing.strip().lower()
+                    tokens_e = le.split()
+
+                    # Exact match
+                    if lower_n == le:
+                        is_redundant = True
+                        break
+
+                    # If this is a single-token alias that matches FIRST or LAST name
+                    # of an already-known full name, skip it
+                    # (e.g. "aditya" vs "aditya khemka", or "khemka" vs "aditya khemka").
+                    if len(tokens_n) == 1 and tokens_e:
+                        if tokens_n[0] == tokens_e[0] or tokens_n[0] == tokens_e[-1]:
+                            is_redundant = True
+                            break
+
+                    # If very similar (typo variants like "khemks"), treat as redundant too.
+                    if _name_similarity(lower_n, le) >= 0.85:
+                        is_redundant = True
+                        break
+
+                if not is_redundant:
+                    cleaned_detected.append(n)
+                    seen_lower.add(lower_n)
 
             # Prefer fused participant count (faces+fusion); fall back to rough face-based estimate
             participant_count = len(participants_fused) if participants_fused else rough_participant_count
 
-            # IMPORTANT: cap the displayed names to the participant count
-            max_names = participant_count if participant_count else len(ordered_detected)
-            detected_names_for_display = ordered_detected[:max_names]
+            # Cap displayed names to participant count
+            max_names = participant_count if participant_count else len(cleaned_detected)
+            detected_names_for_display = cleaned_detected[:max_names]
 
             # 8) Final participants block
             self.results["participants"] = {
@@ -163,7 +253,7 @@ class MeetingProcessor:
                 "person_to_name": person_map,               # "PERSON_1" -> "Aditya Khemka" (canonical)
                 "detected_names": detected_names_for_display,
                 "ocr_names": ocr_name_list[:10],
-                "face_tracking_data": face_data,      
+                "face_tracking_data": face_data[:200],      # limit size
                 "entities": entities[:50],                  # limit entities
             }
 
@@ -175,8 +265,6 @@ class MeetingProcessor:
             return None
 
 
-
-
     # -------------------------------------------------------------------------
     # STEP 3: SENTIMENT
     # -------------------------------------------------------------------------
@@ -184,45 +272,29 @@ class MeetingProcessor:
         """Step 3: Analyze sentiment from both facial expressions and text"""
         print("\n=== Step 3: Sentiment Analysis ===")
         try:
-            # Get full face tracking data
-            full_face_data = self.results.get("participants", {}).get(
+            # Get face tracking data
+            face_data = self.results.get("participants", {}).get(
                 "face_tracking_data", []
             )
 
-            # Sample up to ~80 face tracks *evenly across the meeting* so
-            # facial sentiment covers the whole video instead of only the first seconds.
-            face_samples = []
-            if full_face_data:
-                # Sort by timestamp just to be safe
-                full_face_data = sorted(
-                    full_face_data,
-                    key=lambda f: float(f.get("timestamp", 0.0) or 0.0),
-                )
-                max_samples = 80
-                n = len(full_face_data)
-                if n <= max_samples:
-                    face_samples = full_face_data
-                else:
-                    step = n / float(max_samples)
-                    indices = [int(i * step) for i in range(max_samples)]
-                    face_samples = [full_face_data[i] for i in indices]
-
-            # Facial sentiment analysis
+            # Facial sentiment analysis (use more tracks; facial_sentiment handles sampling)
             emotions_timeline, overall_facial = analyze_facial_sentiment(
                 self.video_path,
-                face_samples,
+                face_data[:80],  # give it up to ~80 tracks; module limits internally
             )
-
 
             # Text sentiment analysis
             transcript_text = self.results.get("transcription", {}).get(
                 "full_text", ""
             )
-            speaker_segments = self.results.get("transcription", {}).get(
-                "speaker_segments", []
+            speaker_labeled_segments = self.results.get("transcription", {}).get(
+                "speaker_labeled_segments", []
             )
 
-            text_sentiment = analyze_text_sentiment(transcript_text, speaker_segments)
+            text_sentiment = analyze_text_sentiment(
+                transcript_text,
+                speaker_labeled_segments,
+            )
 
             # Calculate overall meeting mood
             overall_mood = self._calculate_overall_mood(
@@ -245,7 +317,8 @@ class MeetingProcessor:
             self.results["sentiment"] = {"error": str(e)}
             return None
 
-    # -------------------------------------------------------------------------
+    
+        # -------------------------------------------------------------------------
     # STEP 4: TIMELINE & MOOD CHANGES
     # -------------------------------------------------------------------------
     def process_timeline(self) -> Optional[Dict[str, Any]]:
@@ -254,23 +327,27 @@ class MeetingProcessor:
         try:
             sentiment_data = self.results.get("sentiment", {})
             transcript_data = self.results.get("transcription", {})
+            participants_data = self.results.get("participants", {})
 
-            participants_block = self.results.get("participants", {}) or {}
+            # Extra info for context-aware mood changes
+            speaker_labeled_segments = transcript_data.get("speaker_labeled_segments", [])
+            speaker_to_person = participants_data.get("speaker_to_person", {})
+            person_to_name = participants_data.get("person_to_name", {})
 
             mood_changes = detect_mood_changes(
                 sentiment_data.get("facial_sentiment", {}),
                 sentiment_data.get("text_sentiment", {}),
                 transcript_data.get("speaker_segments", []),
-                transcript_data.get("speaker_labeled_segments", []),
-                participants_block.get("speaker_to_person", {}),
+                speaker_labeled_segments,
+                speaker_to_person,
+                person_to_name,
             )
 
             timeline = create_timeline(
                 transcript_data.get("speaker_segments", []),
                 mood_changes,
-                participants_block.get("face_tracking_data", []),
+                participants_data.get("face_tracking_data", []),
             )
-
 
             self.results["timeline"] = {
                 "mood_changes": mood_changes,
@@ -283,6 +360,8 @@ class MeetingProcessor:
             print(f"✗ Error in timeline processing: {str(e)}")
             self.results["timeline"] = {"error": str(e)}
             return None
+
+
 
     # -------------------------------------------------------------------------
     # STEP 5: TOPIC SEGMENTATION
@@ -332,9 +411,8 @@ class MeetingProcessor:
             print(f"✗ Error generating summary: {e}")
             error = error or str(e)
 
-        # 2) Action items
+        # 2) Action items (speaker-labeled segments + participants for assignees)
         try:
-            # Use speaker-labeled segments + participants so we can attach assignees
             action_items = extract_action_items(
                 transcript_text,
                 self.results.get("transcription", {}).get(
@@ -346,15 +424,21 @@ class MeetingProcessor:
             print(f"✗ Error extracting action items: {e}")
             error = error or str(e)
 
+        # Store summary + items first
         self.results["insights"] = {
             "summary": summary,
             "action_items": action_items,
-            "meeting_metrics": self._calculate_metrics(),
         }
+
+        # Now compute metrics (so action_items_count is correct)
+        self.results["insights"]["meeting_metrics"] = self._calculate_metrics()
+
         if error:
             self.results["insights"]["error"] = error
 
         return self.results["insights"]
+
+
 
 
     # -------------------------------------------------------------------------
@@ -521,7 +605,7 @@ class MeetingProcessor:
 
         return round(max(candidates), 2)
 
-    def _calculate_metrics(self) -> Dict[str, Any]:
+    def _calculate_metrics(self, action_items_override: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         """Calculate various meeting metrics"""
         speaker_segments = self.results.get("transcription", {}).get(
             "speaker_segments", []
@@ -550,6 +634,15 @@ class MeetingProcessor:
             except Exception as e:
                 print(f"⚠ Error while inferring duration from video: {e}")
 
+        # Work out action items – prefer the ones we just computed if provided
+        if action_items_override is not None:
+            action_items_list = action_items_override
+        else:
+            action_items_list = []
+            insights = self.results.get("insights")
+            if isinstance(insights, dict):
+                action_items_list = insights.get("action_items", []) or []
+
         metrics = {
             "duration_seconds": round(duration, 2),
             "duration_minutes": round(duration / 60, 2) if duration else 0.0,
@@ -557,12 +650,10 @@ class MeetingProcessor:
             "total_words": self.results.get("transcription", {}).get("word_count", 0),
             "mood_changes": len(
                 self.results.get("timeline", {}).get("mood_changes", [])
-            ),
-            "action_items_count": len(
-                self.results.get("insights", {}).get("action_items", [])
             )
-            if self.results.get("insights")
+            if self.results.get("timeline")
             else 0,
+            "action_items_count": len(action_items_list),
             "topics_discussed": len(
                 self.results.get("topics", {}).get("topics", [])
             )
@@ -570,6 +661,8 @@ class MeetingProcessor:
             else 0,
         }
         return metrics
+
+
 
     def _save_results(self) -> str:
         """Save results to JSON file"""
