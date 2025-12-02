@@ -479,22 +479,88 @@ class MeetingProcessor:
     def _calculate_overall_mood(
         self, facial_sentiment: Dict[str, Any], text_sentiment: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Calculate combined mood from facial and text sentiment"""
-        mood = {
-            "dominant_emotion": "neutral",
-            "confidence": 0.0,
-            "facial_distribution": facial_sentiment.get("overall", {}),
-            "text_sentiment": text_sentiment.get("overall", {}),
+        """
+        Calculate combined mood from facial and text sentiment.
+
+        - Facial: neutral / happy / sad / angry / fear / disgust (percentages)
+        - Text: positive / negative / neutral (0–1)
+        - Composite: weighted mix so one noisy channel doesn't dominate.
+        """
+        facial_overall = facial_sentiment.get("overall", {}) or {}
+        text_overall = text_sentiment.get("overall", {}) or {}
+        text_dist = text_overall.get("distribution", {}) or {}
+
+        # Text sentiment (0–1)
+        t_pos = float(text_dist.get("positive", 0.0))
+        t_neg = float(text_dist.get("negative", 0.0))
+        t_neu = float(text_dist.get("neutral", 0.0))
+
+        # Decide a "text tone" label, but treat near-ties as neutral/balanced
+        text_max = max(t_pos, t_neg, t_neu) if (t_pos or t_neg or t_neu) else 0.0
+        if text_max < 0.55 or abs(t_pos - t_neg) < 0.20:
+            text_tone_label = "NEUTRAL"
+        elif t_pos > t_neg:
+            text_tone_label = "POSITIVE"
+        else:
+            text_tone_label = "NEGATIVE"
+
+        # Facial: treat as percentages (0–100) → convert to 0–1
+        f_happy = float(facial_overall.get("happy", 0.0)) / 100.0
+        f_neutral = float(facial_overall.get("neutral", 0.0)) / 100.0
+        f_neg = (
+            float(facial_overall.get("sad", 0.0))
+            + float(facial_overall.get("angry", 0.0))
+            + float(facial_overall.get("fear", 0.0))
+            + float(facial_overall.get("disgust", 0.0))
+        ) / 100.0
+
+        # Composite distribution:
+        #  - text is usually more reliable for "tone" → 60%
+        #  - facial is complementary → 40%
+        w_text = 0.6
+        w_face = 0.4
+
+        comp_pos = w_text * t_pos + w_face * f_happy
+        comp_neg = w_text * t_neg + w_face * f_neg
+        comp_neu = w_text * t_neu + w_face * f_neutral
+
+        total = comp_pos + comp_neg + comp_neu
+        if total > 0:
+            comp_pos /= total
+            comp_neg /= total
+            comp_neu /= total
+
+        # Final dominant label from composite
+        if comp_pos >= comp_neg and comp_pos >= comp_neu:
+            overall_label = "positive"
+            confidence = comp_pos
+        elif comp_neg >= comp_pos and comp_neg >= comp_neu:
+            overall_label = "negative"
+            confidence = comp_neg
+        else:
+            overall_label = "neutral"
+            confidence = comp_neu
+
+        return {
+            "dominant_emotion": overall_label,  # "positive" | "negative" | "neutral"
+            "confidence": round(float(confidence), 3),
+            "facial_distribution": facial_overall,
+            "text_sentiment": text_overall,
+            "text_distribution": {
+                "positive": round(t_pos, 3),
+                "negative": round(t_neg, 3),
+                "neutral": round(t_neu, 3),
+            },
+            "composite_distribution": {
+                "positive": round(float(comp_pos), 3),
+                "negative": round(float(comp_neg), 3),
+                "neutral": round(float(comp_neu), 3),
+            },
+            "raw": {
+                "text_tone_label": text_tone_label,
+            },
         }
 
-        # Get dominant facial emotion
-        facial_dist = facial_sentiment.get("overall", {})
-        if facial_dist:
-            dominant = max(facial_dist.items(), key=lambda x: x[1])
-            mood["dominant_emotion"] = dominant[0]
-            mood["confidence"] = dominant[1] / 100.0
-
-        return mood
 
     def _extract_key_moments(self, mood_changes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Extract the most significant mood change moments"""

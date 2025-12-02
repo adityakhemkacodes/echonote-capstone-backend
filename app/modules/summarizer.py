@@ -654,7 +654,6 @@ def generate_summary(
 # Action items extraction (speaker-aware + zero-shot + regex)
 # -------------------------------------------------------------------
 
-
 def _has_action_cue(text: str) -> bool:
     """Cheap filter to pre-select sentences that might contain an action."""
     lower = text.lower()
@@ -693,9 +692,9 @@ def _has_action_cue(text: str) -> bool:
     return any(c in lower for c in cues)
 
 
-def _regex_extract_from_sentence(s: str) -> Optional[str]:
+def _regex_extract_from_sentence(s: str) -> str:
     """
-    Try to slice out the 'action' piece from a sentence using regex.
+    Try to slice out the 'action' part from a sentence using regex.
     If nothing matches, returns the original sentence trimmed.
     """
     patterns = [
@@ -711,43 +710,69 @@ def _regex_extract_from_sentence(s: str) -> Optional[str]:
         if m:
             return m.group(1).strip()
 
-    # Fallback
     return s.strip()
 
 
-def _speaker_name_for_segment(
+def _normalize_action_text(text: str) -> str:
+    """
+    Light cleanup to make action strings more readable, without
+    trying to fully rewrite them (no LLM in the loop here).
+    """
+    s = (text or "").strip()
+
+    # Drop leading filler like "and lastly", "okay", etc.
+    s = re.sub(
+        r"^(and\s+lastly|and\s+also|and|so|then|okay|ok|fine|lastly|also|just)\s+",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    # Normalise contractions we see a lot
+    s = re.sub(r"\bI'll\b", "I will", s, flags=re.IGNORECASE)
+
+    # Ensure it starts with a capital letter
+    if s and not s[0].isupper():
+        s = s[0].upper() + s[1:]
+
+    # Add period if missing, for nicer display
+    if s and s[-1] not in ".!?":
+        s = s + "."
+
+    return s
+
+
+def _speaker_and_person_for_segment(
     seg: Dict[str, Any], participants: Optional[Dict[str, Any]]
-) -> str:
+) -> (Optional[str], Optional[str], Optional[str]):
     """
-    Map diarized speaker_id -> canonical human name if possible.
+    Resolve speaker_id -> (person_id, canonical name) where possible.
+    Returns (speaker_id, person_id, name).
     """
-    if not participants:
-        return seg.get("speaker_id") or seg.get("speaker") or "Unknown speaker"
+    sid = seg.get("speaker_id") or seg.get("speaker")
+    if not participants or not sid:
+        return sid, None, None
 
     speaker_to_person = participants.get("speaker_to_person", {}) or {}
     person_to_name = participants.get("person_to_name", {}) or {}
 
-    # Also allow retrieving canonical_name from participants list as fallback
-    participants_list = participants.get("participants") or participants.get(
-        "participants_fused"
-    ) or []
+    participants_list = (
+        participants.get("participants")
+        or participants.get("participants_fused")
+        or []
+    )
     pid_to_canonical = {
         p.get("participant_id"): p.get("canonical_name")
         for p in participants_list
         if p.get("participant_id")
     }
 
-    sid = seg.get("speaker_id") or seg.get("speaker")
-    if not sid:
-        return "Unknown speaker"
-
     pid = speaker_to_person.get(sid)
     if not pid:
-        # No mapping from diarization -> face -> person
-        return sid
+        return sid, None, None
 
     name = person_to_name.get(pid) or pid_to_canonical.get(pid)
-    return name or pid or sid
+    return sid, pid, name
 
 
 def _extract_actions_speaker_aware(
@@ -785,8 +810,9 @@ def _extract_actions_speaker_aware(
 
     # 2) Run zero-shot on batch of candidate segment texts
     labels = ["action", "decision", "blocker", "other"]
-    zs_results = classifier(candidate_texts, candidate_labels=labels, multi_label=False)
-
+    zs_results = classifier(
+        candidate_texts, candidate_labels=labels, multi_label=False
+    )
     if isinstance(zs_results, dict):
         zs_results = [zs_results]
 
@@ -797,35 +823,37 @@ def _extract_actions_speaker_aware(
         top_label = res["labels"][0]
         top_score = float(res["scores"][0])
 
+        # Keep strong "action" / "blocker" / "decision" items
         if top_label not in ("action", "decision", "blocker") or top_score < 0.6:
             continue
 
-        full_sent = (seg.get("text") or "").strip()
-        action_text = _regex_extract_from_sentence(full_sent)
-
-        # discard useless / too short after slicing
-        if len(action_text) < 10:
+        full_text = (seg.get("text") or "").strip()
+        raw_action = _regex_extract_from_sentence(full_text)
+        if len(raw_action) < 10:
+            continue
+        if _is_noise_sentence(raw_action):
             continue
 
-        if _is_noise_sentence(action_text):
-            continue
+        normalized_action = _normalize_action_text(raw_action)
 
-        assignee = _speaker_name_for_segment(seg, participants)
+        sid, pid, assignee_name = _speaker_and_person_for_segment(seg, participants)
 
-        key = (action_text.lower(), assignee.lower())
+        key = (normalized_action.lower(), assignee_name.lower() if assignee_name else "")
         if key in seen:
             continue
         seen.add(key)
 
         action_items.append(
             {
-                "action": action_text,
-                "role": top_label,  # "action" | "decision" | "blocker"
-                "confidence": round(top_score, 3),
-                "assignee": assignee,
-                "speaker_id": seg.get("speaker_id") or seg.get("speaker"),
-                "start": seg.get("start", 0.0),
-                "end": seg.get("end", 0.0),
+                "action": normalized_action,
+                "role": top_label,                  # "action" | "decision" | "blocker"
+                "score": round(top_score, 3),
+                "confidence": "high" if top_score >= 0.85 else "medium",
+                "assignee": assignee_name,
+                "speaker_id": sid,
+                "person_id": pid,
+                "start": float(seg.get("start", 0.0) or 0.0),
+                "end": float(seg.get("end", 0.0) or 0.0),
             }
         )
 
@@ -834,8 +862,7 @@ def _extract_actions_speaker_aware(
 
 def _extract_actions_regex_only(transcript: str) -> List[Dict[str, Any]]:
     """
-    Fallback: regex-based action extraction with no assignees.
-    This is essentially your previous behaviour.
+    Fallback: regex-based action extraction with no speaker/participant info.
     """
     transcript = (transcript or "").strip()
     if not transcript:
@@ -852,21 +879,22 @@ def _extract_actions_regex_only(transcript: str) -> List[Dict[str, Any]]:
     ]
 
     for pattern in patterns:
-        matches = re.finditer(pattern, transcript, re.IGNORECASE)
-        for match in matches:
-            action_text = match.group(1).strip()
-            if not (10 < len(action_text) < 200):
+        for match in re.finditer(pattern, transcript, re.IGNORECASE):
+            raw = match.group(1).strip()
+            if not (10 < len(raw) < 200):
+                continue
+            if _is_noise_sentence(raw):
                 continue
 
-            lower = action_text.lower()
-            if any(k in lower for k in _NOISE_KEYWORDS):
-                continue
+            normalized_action = _normalize_action_text(raw)
+            lower = normalized_action.lower()
 
             # Require at least one "work-like" verb
             if not re.search(
                 r"\b("
                 r"build|fix|finish|implement|test|deploy|create|update|review|prepare|"
-                r"send|schedule|refactor|write|design|discuss|analyze|monitor|complete|done"
+                r"send|schedule|refactor|write|design|discuss|analyze|monitor|complete|"
+                r"learn|study|improve|optimize"
                 r")\b",
                 lower,
             ):
@@ -875,14 +903,19 @@ def _extract_actions_regex_only(transcript: str) -> List[Dict[str, Any]]:
 
             action_items.append(
                 {
-                    "action": action_text,
+                    "action": normalized_action,
                     "role": "action",
-                    "confidence": 0.5,
+                    "score": 0.5,
+                    "confidence": "medium",
                     "assignee": None,
+                    "speaker_id": None,
+                    "person_id": None,
+                    "start": None,
+                    "end": None,
                 }
             )
 
-    # deduplicate
+    # Deduplicate
     seen = set()
     unique: List[Dict[str, Any]] = []
     for item in action_items:
@@ -894,34 +927,18 @@ def _extract_actions_regex_only(transcript: str) -> List[Dict[str, Any]]:
     return unique
 
 
-# -------------------------------------------------------------------
-# Action items extraction (regex + speaker/participant linking)
-# -------------------------------------------------------------------
-
 def extract_action_items(
     transcript: str,
     speaker_segments: Optional[List[Dict[str, Any]]] = None,
     participants: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Extract action items and tasks from meeting transcript.
+    Public entrypoint used by MeetingProcessor.
 
-    Improvements:
-    - Still uses regex + heuristics to find "task-like" phrases.
-    - If speaker-labeled segments are provided, we:
-        * look for actions inside each speaker's text
-        * map speaker_id -> person_id -> canonical_name
-        * attach assignee info to each action
-    - Falls back to transcript-only extraction if no segments are available.
-
-    Returns a list of dicts:
-      {
-        "action": str,
-        "assignee": Optional[str],   # canonical participant name if known
-        "speaker_id": Optional[str], # e.g. "SPEAKER_00"
-        "person_id": Optional[str],  # e.g. "PERSON_1"
-        "confidence": "high" | "medium"
-      }
+    - Prefer speaker-aware extraction (diarization + zero-shot).
+    - Fall back to regex-only if we don't have diarized segments.
+    - Always return deduplicated, normalized action items with
+      assignee info when possible.
     """
     print("Extracting action items...")
 
@@ -929,121 +946,35 @@ def extract_action_items(
     if not transcript:
         return []
 
-    action_items: List[Dict[str, Any]] = []
+    items: List[Dict[str, Any]] = []
 
-    # Common action phrases (unchanged core idea)
-    action_patterns = [
-        r"(?:will|should|need to|must|have to|going to)\s+([^.!?]+)",
-        r"action item[s]?:\s*([^.!?]+)",
-        r"to-?do[s]?:\s*([^.!?]+)",
-        r"(?:please|let's)\s+([^.!?]+)",
-        r"(?:I|we|you|they)(?:'ll| will)\s+([^.!?]+)",
-    ]
-
-    # Precompute mapping: speaker_id -> (person_id, canonical_name)
-    speaker_to_person = {}
-    person_to_name = {}
-
-    if participants:
-        speaker_to_person = participants.get("speaker_to_person", {}) or {}
-        person_to_name = participants.get("person_to_name", {}) or {}
-
-    def _add_action_item(action_text: str, speaker_id: Optional[str]) -> None:
-        """Internal helper to filter and append an action item."""
-        # Clean & basic length checks
-        action_text = action_text.strip()
-        if not (10 < len(action_text) < 200):
-            return
-
-        lower = action_text.lower()
-
-        # Drop noisy / non-business actions
-        if any(k in lower for k in _NOISE_KEYWORDS):
-            return
-
-        # Require at least one "work-like" verb
-        if not re.search(
-            r"\b("
-            r"build|fix|finish|implement|test|deploy|create|update|review|prepare|"
-            r"send|schedule|refactor|write|design|discuss|analyze|monitor|complete|"
-            r"done|learn|study|improve|optimize"
-            r")\b",
-            lower,
-        ):
-            # still keep some generic phrases like "be done before Friday"
-            if not re.search(r"\b(done|complete|before)\b", lower):
-                return
-
-        # -------------------------
-        # Assignee inference
-        # -------------------------
-        person_id: Optional[str] = None
-        assignee_name: Optional[str] = None
-
-        if speaker_id is not None:
-            sid_str = str(speaker_id)
-            pid = speaker_to_person.get(sid_str)
-            if pid:
-                person_id = pid
-                assignee_name = person_to_name.get(pid)
-
-        confidence = "high" if assignee_name else "medium"
-
-        action_items.append(
-            {
-                "action": action_text,
-                "assignee": assignee_name,
-                "speaker_id": str(speaker_id) if speaker_id is not None else None,
-                "person_id": person_id,
-                "confidence": confidence,
-            }
-        )
-
-    # ------------------------------------------------------
-    # Mode 1 — Use speaker-labeled segments (preferred)
-    # ------------------------------------------------------
+    # Preferred path: diarized segments + participants
     if speaker_segments:
-        for seg in speaker_segments:
-            seg_text = (seg.get("text") or "").strip()
-            if not seg_text:
-                continue
+        items = _extract_actions_speaker_aware(transcript, speaker_segments, participants)
 
-            speaker_id = seg.get("speaker_id") or seg.get("speaker")
+    # Fallback: global regex if nothing turned up
+    if not items:
+        items = _extract_actions_regex_only(transcript)
 
-            for pattern in action_patterns:
-                for match in re.finditer(pattern, seg_text, re.IGNORECASE):
-                    action_text = match.group(1).strip()
-                    _add_action_item(action_text, speaker_id)
-
-    # ------------------------------------------------------
-    # Mode 2 — Fallback: global regex over full transcript
-    # ------------------------------------------------------
-    else:
-        for pattern in action_patterns:
-            for match in re.finditer(pattern, transcript, re.IGNORECASE):
-                action_text = match.group(1).strip()
-                _add_action_item(action_text, None)
-
-    # ------------------------------------------------------
-    # De-duplicate while preserving order
-    # ------------------------------------------------------
+    # Final safety dedupe
     seen = set()
-    unique_actions: List[Dict[str, Any]] = []
-    for item in action_items:
+    unique: List[Dict[str, Any]] = []
+    for it in items:
         key = (
-            (item["action"] or "").lower(),
-            item.get("assignee") or "",
-            item.get("speaker_id") or "",
+            (it.get("action") or "").lower(),
+            it.get("assignee") or "",
+            it.get("speaker_id") or "",
         )
         if key not in seen:
             seen.add(key)
-            unique_actions.append(item)
+            unique.append(it)
 
-    result = unique_actions[:15]
-    assigned_count = sum(1 for a in result if a.get("assignee"))
     print(
-        f"✓ Extracted {len(result)} action items"
-        + (f" ({assigned_count} with assignee)" if result else "")
+        f"✓ Extracted {len(unique)} action items"
+        + (
+            f" ({sum(1 for a in unique if a.get('assignee'))} with assignee)"
+            if unique
+            else ""
+        )
     )
-    return result
-
+    return unique[:15]
