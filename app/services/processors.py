@@ -387,57 +387,45 @@ class MeetingProcessor:
             return None
 
         # -------------------------------------------------------------------------
-    # STEP 6: SUMMARY & ACTIONABLE INSIGHTS
+    # STEP 6: SUMMARY & ACTIONABLE INSIGHTS (Gemini)
     # -------------------------------------------------------------------------
     def generate_insights(self) -> Dict[str, Any]:
-        """Step 6: Generate summary and actionable insights"""
-        print("\n=== Step 6: Generating Insights ===")
+        print("\n=== Step 6: Generating Insights (Gemini) ===")
 
-        transcript_text = self.results.get("transcription", {}).get("full_text", "")
+        transcript = self.results.get("transcription", {}).get("full_text", "") or ""
 
-        summary = None
-        action_items: List[Dict[str, Any]] = []
-        error: Optional[str] = None
-
-        # 1) Summary
+        # --- SUMMARY ---
         try:
             summary = generate_summary(
-                transcript_text,
+                transcript,
                 self.results.get("sentiment", {}),
                 self.results.get("topics", {}),
                 self.results.get("participants", {}),
             )
         except Exception as e:
-            print(f"✗ Error generating summary: {e}")
-            error = error or str(e)
+            print("✗ Summary error:", e)
+            summary = {"main_summary": "(summary unavailable)", "key_topics": []}
 
-        # 2) Action items (speaker-labeled segments + participants for assignees)
+        # --- ACTION ITEMS ---
         try:
             action_items = extract_action_items(
-                transcript_text,
-                self.results.get("transcription", {}).get(
-                    "speaker_labeled_segments", []
-                ),
+                transcript,
+                self.results.get("transcription", {}).get("speaker_labeled_segments", []),
                 self.results.get("participants", {}),
             )
         except Exception as e:
-            print(f"✗ Error extracting action items: {e}")
-            error = error or str(e)
+            print("✗ Action item error:", e)
+            action_items = []
 
-        # Store summary + items first
         self.results["insights"] = {
             "summary": summary,
             "action_items": action_items,
         }
 
-        # Now compute metrics (so action_items_count is correct)
+        # metrics AFTER summary & actions
         self.results["insights"]["meeting_metrics"] = self._calculate_metrics()
 
-        if error:
-            self.results["insights"]["error"] = error
-
         return self.results["insights"]
-
 
 
 
