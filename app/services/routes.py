@@ -349,3 +349,85 @@ def internal_error(error):
         'error': 'Internal server error',
         'details': str(error)
     }), 500
+
+# Add to routes.py - NEW ENDPOINT for audio files
+
+@api.route('/upload_audio', methods=['POST'])
+def upload_audio_files():
+    """
+    Upload multiple individual audio files (Zoom format)
+    Returns: file_ids and participant names
+    """
+    try:
+        if 'files' not in request.files:
+            return jsonify({'error': 'No files in request'}), 400
+        
+        files = request.files.getlist('files')
+        uploaded_files = []
+        
+        # Temporarily allow audio extensions
+        original_allowed = file_handler.allowed_file
+        
+        for file in files:
+            filename = secure_filename(file.filename)
+            # Check for audio extensions
+            if not any(filename.lower().endswith(ext) for ext in ['.m4a', '.mp3', '.wav', '.aac']):
+                continue
+                
+            filepath = file_handler.upload_folder / filename
+            file.save(str(filepath))
+            uploaded_files.append(str(filepath))
+        
+        from app.modules.audio_name_extraction import extract_names_from_audio_files
+        name_mapping = extract_names_from_audio_files(uploaded_files)
+        
+        batch_id = f"audio_batch_{len(processing_status)}"
+        processing_status[batch_id] = {
+            'status': 'uploaded',
+            'audio_files': uploaded_files,
+            'name_mapping': name_mapping,
+            'type': 'individual_audio'
+        }
+        
+        return jsonify({
+            'message': 'Audio files uploaded successfully',
+            'batch_id': batch_id,
+            'files': name_mapping
+        }), 200
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@api.route('/process_audio/<batch_id>', methods=['POST'])
+def process_audio_batch(batch_id: str):
+    """Process a batch of individual audio files"""
+    try:
+        if batch_id not in processing_status:
+            return jsonify({'error': 'Batch not found'}), 404
+        
+        batch_info = processing_status[batch_id]
+        audio_files = batch_info['audio_files']
+        
+        # Use the new audio processing method
+        processor = MeetingProcessor("")  # No video path needed
+        processor.process_individual_audio_files(audio_files)
+        
+        # Continue with sentiment, topics, etc.
+        processor.process_sentiment()
+        processor.process_timeline()
+        processor.process_topics()
+        processor.generate_insights()
+        
+        processor.results['status'] = 'completed'
+        processing_status[batch_id]['results'] = processor.results
+        processing_status[batch_id]['status'] = 'completed'
+        
+        return jsonify({
+            'message': 'Audio processing completed',
+            'batch_id': batch_id,
+            'results': processor.results
+        }), 200
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500

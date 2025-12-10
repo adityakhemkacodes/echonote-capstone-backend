@@ -6,7 +6,7 @@ from werkzeug.utils import secure_filename
 from werkzeug.datastructures import FileStorage
 
 UPLOAD_FOLDER = Path("uploads")
-ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv', 'webm', 'flv'}
+ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv', 'webm', 'flv', 'm4a', 'mp3', 'wav', 'aac'}
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
 
 class FileHandler:

@@ -737,8 +737,54 @@ class MeetingProcessor:
         """Get current processing results"""
         return self.results
 
-
 def process_meeting_video(video_path: str, save_output: bool = True) -> Dict[str, Any]:
     """Convenience function to process a meeting video"""
     processor = MeetingProcessor(video_path)
     return processor.process_all(save_output=save_output)
+
+# Add this NEW METHOD to MeetingProcessor class in processors.py
+# Put it after __init__ but before process_transcription
+
+def process_individual_audio_files(self, audio_files: List[str]) -> Dict[str, Any]:
+    """
+    NEW: Process individual Zoom audio files instead of video.
+    This skips face tracking and OCR, using filenames for names.
+    """
+    print("\n=== Processing Individual Audio Files ===")
+    
+    from app.modules.audio_name_extraction import extract_names_from_audio_files
+    from app.modules.transcribe import transcribe_multiple_audio_files
+    
+    # Extract names from filenames
+    name_mapping = extract_names_from_audio_files(audio_files)
+    print(f"✓ Extracted {len(name_mapping)} participant names from filenames")
+    
+    # Transcribe all audio files with names
+    transcript, speaker_segments = transcribe_multiple_audio_files(name_mapping)
+    
+    # Store transcription results
+    self.results["transcription"] = {
+        "full_text": transcript,
+        "speaker_labeled_segments": speaker_segments,
+        "word_count": len(transcript.split()) if transcript else 0,
+        "source": "individual_audio_files"
+    }
+    
+    # Store participant information (skip face tracking/OCR)
+    valid_names = [item["name"] for item in name_mapping if item["name"]]
+    
+    self.results["participants"] = {
+        "count": len(valid_names),
+        "detected_names": valid_names,
+        "participants": [
+            {
+                "canonical_name": item["name"],
+                "audio_file": item["file"],
+                "participant_id": f"AUDIO_{i}"
+            }
+            for i, item in enumerate(name_mapping) if item["name"]
+        ],
+        "source": "audio_filenames"
+    }
+    
+    return self.results
