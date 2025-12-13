@@ -2,11 +2,9 @@
 """
 Gemini-based summarizer + action item extractor.
 
-- generate_summary(...): uses Gemini to produce an executive summary + key topics
-- extract_action_items(...): uses Gemini to extract structured action items
-
-Both functions keep the same public signatures as the previous implementation,
-so MeetingProcessor and the rest of the pipeline can stay unchanged.
+Updates:
+- Post-process Gemini outputs to snap guessed names to detected participant names
+  for THIS meeting (no hardcoded mapping).
 """
 
 import os
@@ -15,51 +13,35 @@ import json
 import warnings
 import textwrap
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
+from dotenv import load_dotenv
+
+load_dotenv(dotenv_path=Path.cwd() / ".env", override=True)
 
 warnings.filterwarnings("ignore")
-
-# -------------------------------------------------------------------
-# Gemini SDK import
-# -------------------------------------------------------------------
 
 _GEMINI_AVAILABLE = False
 _GEMINI_IMPORT_ERROR = None
 
 try:
     import google.generativeai as genai  # type: ignore
-
     _GEMINI_AVAILABLE = True
 except Exception as e:  # pragma: no cover
     _GEMINI_AVAILABLE = False
     _GEMINI_IMPORT_ERROR = e
 
 
-# -------------------------------------------------------------------
-# API key loading / model helper
-# -------------------------------------------------------------------
-
 def _load_gemini_api_key() -> Optional[str]:
-    """
-    Load Gemini API key from:
-      1) GEMINI_API_KEY
-      2) GOOGLE_API_KEY
-      3) .gemini_key file in app/ or project root
-
-    This avoids Windows env-var weirdness: you can just create a `.gemini_key`
-    file with your key in it if you prefer.
-    """
     key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if key:
         return key.strip()
 
-    # Fallback: look for a .gemini_key file
     try:
         here = Path(__file__).resolve()
         candidates = [
-            here.parent / ".gemini_key",          # app/modules/.gemini_key
-            here.parent.parent / ".gemini_key",   # app/.gemini_key
-            here.parent.parent.parent / ".gemini_key",  # project root/.gemini_key
+            here.parent / ".gemini_key",
+            here.parent.parent / ".gemini_key",
+            here.parent.parent.parent / ".gemini_key",
         ]
         for p in candidates:
             if p.is_file():
@@ -73,16 +55,6 @@ def _load_gemini_api_key() -> Optional[str]:
 
 
 def _get_gemini_model(model_name: Optional[str] = None):
-    """
-    Lazy-configures Gemini and returns a GenerativeModel instance.
-
-    Model resolution order:
-      1. Explicit `model_name` argument
-      2. GEMINI_MODEL env var
-      3. Default: "models/gemini-pro-latest"
-
-    You can see available models for your key by running list_gemini_models.py.
-    """
     if not _GEMINI_AVAILABLE:
         raise RuntimeError(f"Gemini SDK not available: {_GEMINI_IMPORT_ERROR}")
 
@@ -95,52 +67,21 @@ def _get_gemini_model(model_name: Optional[str] = None):
 
     genai.configure(api_key=api_key)
 
-    # Prefer explicit arg, then env, then default to a REAL model id
-    raw_name = model_name or os.getenv("GEMINI_MODEL") or "models/gemini-pro-latest"
-    raw_name = (raw_name or "").strip()
-
-    # Simple aliases for older-style names if you ever use them
-    alias_map = {
-        "gemini-pro": "models/gemini-pro-latest",
-        "gemini-flash": "models/gemini-flash-latest",
-        "gemini-flash-latest": "models/gemini-flash-latest",
-        "gemini-pro-latest": "models/gemini-pro-latest",
-    }
-    effective_name = alias_map.get(raw_name, raw_name)
-
+    raw_name = model_name or os.getenv("GEMINI_MODEL") or "models/gemini-2.5-flash"
+    effective_name = (raw_name or "").strip()
     print(f"[Gemini] Using model: {effective_name}")
     return genai.GenerativeModel(effective_name)
 
 
-
-
-# -------------------------------------------------------------------
-# Basic text helpers
-# -------------------------------------------------------------------
-
 _NOISE_KEYWORDS = [
-    "coffee",
-    "tea",
-    "lunch",
-    "snack",
-    "pizza",
-    "mascot",
-    "cat ",
-    "cats ",
-    "joke",
-    "laugh",
-    "crying",
-    "dark mode powered by chaos",
-    "coffee machine",
-    "construction noise",
-    "wifi",
-    "wi-fi",
-    "headset",
+    "coffee", "tea", "lunch", "snack", "pizza",
+    "mascot", "cat ", "cats ", "joke", "laugh", "crying",
+    "dark mode powered by chaos", "coffee machine",
+    "construction noise", "wifi", "wi-fi", "headset",
 ]
 
 
 def _split_into_sentences(text: str) -> List[str]:
-    """Crude sentence splitter, good enough for transcripts."""
     text = (text or "").strip()
     if not text:
         return []
@@ -154,21 +95,14 @@ def _is_noise_sentence(s: str) -> bool:
 
 
 def _clean_transcript_for_summarization(text: str) -> str:
-    """
-    Remove obvious small talk / setup noise so the summarizer
-    focuses on the actual meeting content.
-    """
     sentences = _split_into_sentences(text)
     cleaned: List[str] = []
 
     for s in sentences:
         if len(s) < 15:
-            # ultra-short fragments are usually ASR noise or fillers
             continue
 
         lower = s.lower()
-
-        # greetings / closings / pure chit-chat
         if any(
             p in lower
             for p in [
@@ -191,7 +125,6 @@ def _clean_transcript_for_summarization(text: str) -> str:
 
         cleaned.append(s)
 
-    # fallback: if we stripped too aggressively, use original text
     if len(" ".join(cleaned).split()) < 30:
         return text.strip()
 
@@ -199,19 +132,13 @@ def _clean_transcript_for_summarization(text: str) -> str:
 
 
 def _safe_json_from_text(raw: str) -> Optional[Any]:
-    """
-    Try to recover a JSON object/array from a model response that *should*
-    be JSON but may have extra text around it.
-    """
     raw = (raw or "").strip()
 
-    # If it's already pure JSON, try directly
     try:
         return json.loads(raw)
     except Exception:
         pass
 
-    # Try to extract the first {...} or [...] block
     first_brace = raw.find("{")
     last_brace = raw.rfind("}")
     first_bracket = raw.find("[")
@@ -232,50 +159,180 @@ def _safe_json_from_text(raw: str) -> Optional[Any]:
     return None
 
 
-# -------------------------------------------------------------------
-# Gemini prompt helpers
-# -------------------------------------------------------------------
+def _extract_participant_names(participants: Optional[Union[Dict[str, Any], List[Any]]]) -> List[str]:
+    if not participants:
+        return []
+
+    names: List[str] = []
+
+    if isinstance(participants, list):
+        for p in participants:
+            if isinstance(p, dict):
+                nm = p.get("canonical_name") or p.get("name") or p.get("display_name")
+                if nm:
+                    names.append(str(nm))
+        out = []
+        seen = set()
+        for n in names:
+            k = n.strip().lower()
+            if k and k not in seen:
+                seen.add(k)
+                out.append(n.strip())
+        return out
+
+    if isinstance(participants, dict):
+        direct = participants.get("detected_names") or participants.get("names") or []
+        if isinstance(direct, list):
+            for n in direct:
+                if n:
+                    names.append(str(n))
+
+        plist = (
+            participants.get("participants")
+            or participants.get("participants_fused")
+            or participants.get("speaker_registry")
+            or []
+        )
+        if isinstance(plist, list):
+            for p in plist:
+                if not isinstance(p, dict):
+                    continue
+                nm = p.get("canonical_name") or p.get("name") or p.get("display_name")
+                if nm:
+                    names.append(str(nm))
+
+    out = []
+    seen = set()
+    for n in names:
+        k = n.strip().lower()
+        if k and k not in seen:
+            seen.add(k)
+            out.append(n.strip())
+    return out
+
+
+def _extract_participant_count(participants: Optional[Union[Dict[str, Any], List[Any]]]) -> int:
+    if not participants:
+        return 0
+    if isinstance(participants, list):
+        return len(participants)
+    if isinstance(participants, dict):
+        c = participants.get("count") or participants.get("participant_count")
+        if isinstance(c, int):
+            return c
+        names = _extract_participant_names(participants)
+        return len(names)
+    return 0
+
+
+# ----------------------------
+# NEW: name snapping helpers
+# ----------------------------
+
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+def _name_similarity(a: str, b: str) -> float:
+    """
+    Token+char similarity (lightweight, no deps).
+    """
+    a_norm = _norm(a)
+    b_norm = _norm(b)
+    if not a_norm or not b_norm:
+        return 0.0
+    if a_norm == b_norm:
+        return 1.0
+
+    a_tokens = set(a_norm.split())
+    b_tokens = set(b_norm.split())
+    inter = len(a_tokens & b_tokens)
+    union = len(a_tokens | b_tokens) or 1
+    token_sim = inter / union
+
+    # cheap char sim
+    from difflib import SequenceMatcher
+    char_sim = SequenceMatcher(None, a_norm, b_norm).ratio()
+
+    return 0.6 * char_sim + 0.4 * token_sim
+
+
+def _snap_name_to_participants(raw_name: Optional[str], participant_names: List[str]) -> Optional[str]:
+    """
+    Snap Gemini's guessed name to the closest detected participant name for THIS meeting.
+    No manual mapping; just fuzzy match.
+    """
+    if not raw_name or not isinstance(raw_name, str):
+        return None
+
+    raw = raw_name.strip()
+    if not raw:
+        return None
+
+    if not participant_names:
+        return raw
+
+    best = None
+    best_score = 0.0
+
+    for p in participant_names:
+        sc = _name_similarity(raw, p)
+        # slight boost if first token matches (helps "Adi Nader" -> "Aadi N")
+        r0 = _norm(raw).split()[:1]
+        p0 = _norm(p).split()[:1]
+        if r0 and p0 and r0[0] == p0[0]:
+            sc += 0.08
+        if sc > best_score:
+            best_score = sc
+            best = p
+
+    # conservative threshold: don't rewrite random stuff
+    if best and best_score >= 0.62:
+        return best
+    return raw
+
+
+def _replace_names_in_text(text: str, participant_names: List[str]) -> str:
+    """
+    Replace any 'near-miss' names in summary text with snapped names
+    only when a clear match exists.
+    """
+    if not text or not participant_names:
+        return text
+
+    # Find candidate "Name-like" spans (2 tokens or token+initial).
+    # We only replace when snapping changes it.
+    pattern = re.compile(r"\b([A-Z][a-z]{1,20})(?:\s+([A-Z][a-z]{1,20}|[A-Z]))\b")
+    def repl(m):
+        cand = m.group(0)
+        snapped = _snap_name_to_participants(cand, participant_names)
+        return snapped if snapped and snapped != cand else cand
+
+    return pattern.sub(repl, text)
+
 
 def _gemini_meeting_summary_call(
     transcript: str,
     sentiment_data: Optional[Dict[str, Any]],
     topics: Optional[Dict[str, Any]],
-    participants: Optional[Dict[str, Any]],
+    participants: Optional[Union[Dict[str, Any], List[Any]]],
 ) -> Dict[str, Any]:
-    """
-    Ask Gemini for a structured meeting summary.
-
-    Expected JSON shape:
-
-    {
-      "main_summary": "string",
-      "key_topics": ["topic 1", "topic 2", ...]
-    }
-    """
     model = _get_gemini_model()
 
     meta_bits = []
 
-    # sentiment
     if sentiment_data and isinstance(sentiment_data, dict):
-        overall = (
-            sentiment_data.get("overall_mood")
-            or sentiment_data.get("overall")
-            or {}
-        )
+        overall = sentiment_data.get("overall_mood") or sentiment_data.get("overall") or {}
         if overall:
             meta_bits.append(f"Heuristic overall sentiment: {overall}")
 
-    # participants
-    if participants and isinstance(participants, dict):
-        count = participants.get("count") or participants.get("participant_count")
-        names = participants.get("detected_names") or participants.get("names") or []
-        if count:
-            meta_bits.append(f"Estimated participant count: {count}")
-        if names:
-            meta_bits.append("Detected participant names: " + ", ".join(names))
+    count = _extract_participant_count(participants)
+    names = _extract_participant_names(participants)
+    if count:
+        meta_bits.append(f"Estimated participant count: {count}")
+    if names:
+        meta_bits.append("Detected participant names: " + ", ".join(names))
 
-    # topics
     if topics and isinstance(topics, dict) and topics.get("topics"):
         top_summaries = []
         for t in topics["topics"][:3]:
@@ -337,56 +394,22 @@ def _gemini_meeting_summary_call(
     key_topics = parsed.get("key_topics") or []
     if not isinstance(key_topics, list):
         key_topics = [str(key_topics)]
-
     key_topics = [str(t).strip() for t in key_topics if str(t).strip()]
 
     if not main_summary:
-        main_summary = (
-            transcript[:500] + "..." if len(transcript) > 500 else transcript
-        )
+        main_summary = transcript[:500] + "..." if len(transcript) > 500 else transcript
 
-    return {
-        "main_summary": main_summary,
-        "key_topics": key_topics,
-    }
+    return {"main_summary": main_summary, "key_topics": key_topics}
 
 
 def _gemini_action_items_call(
     transcript: str,
     speaker_segments: Optional[List[Dict[str, Any]]] = None,
-    participants: Optional[Dict[str, Any]] = None,
+    participants: Optional[Union[Dict[str, Any], List[Any]]] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Ask Gemini to extract structured action items.
-
-    We ask Gemini to return a JSON array of objects:
-
-    [
-      {
-        "action": "concrete action phrased as a task",
-        "role": "action | decision | blocker",
-        "confidence": "low | medium | high",
-        "assignee": "Name of person responsible or null if unknown"
-      },
-      ...
-    ]
-    """
     model = _get_gemini_model()
 
-    # Give Gemini some participant names to help assign owners
-    participant_names: List[str] = []
-    if participants and isinstance(participants, dict):
-        participant_names = participants.get("detected_names") or []
-        if not participant_names:
-            plist = (
-                participants.get("participants")
-                or participants.get("participants_fused")
-                or []
-            )
-            for p in plist:
-                nm = p.get("canonical_name") or p.get("name")
-                if nm:
-                    participant_names.append(str(nm))
+    participant_names = _extract_participant_names(participants)
     names_hint = ", ".join(participant_names) if participant_names else "unknown"
 
     user_prompt = textwrap.dedent(
@@ -424,8 +447,6 @@ def _gemini_action_items_call(
             "assignee": "Name of responsible person or null if not clear"
           }}
         ]
-
-        Do not include any explanation or markdown, just the JSON array.
         """
     ).strip()
 
@@ -459,91 +480,57 @@ def _gemini_action_items_call(
         else:
             assignee = None
 
-        results.append(
-            {
-                "action": action,
-                "role": role,
-                "confidence": confidence,
-                "assignee": assignee,
-            }
-        )
+        results.append({"action": action, "role": role, "confidence": confidence, "assignee": assignee})
 
     return results
 
-
-# -------------------------------------------------------------------
-# PUBLIC API: generate_summary
-# -------------------------------------------------------------------
 
 def generate_summary(
     transcript: str,
     sentiment_data: Optional[Dict[str, Any]] = None,
     topics: Optional[Dict[str, Any]] = None,
-    participants: Optional[Dict[str, Any]] = None,
+    participants: Optional[Union[Dict[str, Any], List[Any]]] = None,
 ) -> Dict[str, Any]:
-    """
-    Generate a clean, human-readable meeting summary using Gemini.
-
-    Returns a dict with at least:
-      {
-        "main_summary": str,
-        "participant_count": int,
-        "detected_names": List[str],
-        "overall_sentiment": Dict,
-        "key_topics": List[str],
-        "llm_source": "gemini" | "fallback"
-      }
-    """
-
     print("Generating meeting summary (Gemini)...")
 
     transcript = (transcript or "").strip()
     MIN_WORDS = 20
     word_count = len(transcript.split())
 
+    detected_names = _extract_participant_names(participants)
+    participant_count = _extract_participant_count(participants)
+
     base_payload = {
-        "participant_count": participants.get("count", 0) if participants else 0,
-        "detected_names": participants.get("detected_names", [])
-        if participants
-        else [],
-        "overall_sentiment": sentiment_data.get("overall_mood", {})
-        if sentiment_data
-        else {},
+        "participant_count": participant_count,
+        "detected_names": detected_names,
+        "overall_sentiment": sentiment_data.get("overall_mood", {}) if sentiment_data else {},
         "key_topics": [],
         "llm_source": "fallback",
     }
 
     if not transcript or word_count < MIN_WORDS:
         print(f"✗ Not enough transcript text for summarization (words={word_count})")
-        return {
-            **base_payload,
-            "main_summary": "Not enough speech was detected to generate a meaningful summary.",
-        }
+        return {**base_payload, "main_summary": "Not enough speech was detected to generate a meaningful summary."}
 
     cleaned = _clean_transcript_for_summarization(transcript)
-    max_chars = 12000
-    cleaned = cleaned[:max_chars]
+    cleaned = cleaned[:12000]
 
     if not _GEMINI_AVAILABLE:
-        print(
-            f"✗ Gemini SDK not available; "
-            f"returning simple heuristic summary instead ({_GEMINI_IMPORT_ERROR})"
-        )
+        print(f"✗ Gemini SDK not available; returning fallback ({_GEMINI_IMPORT_ERROR})")
         sentences = _split_into_sentences(cleaned)
         summary = " ".join(sentences[:5]) if sentences else cleaned[:500]
-        return {
-            **base_payload,
-            "main_summary": summary,
-            "llm_source": "fallback_sdk_missing",
-        }
+        return {**base_payload, "main_summary": summary, "llm_source": "fallback_sdk_missing"}
 
     try:
-        summary_struct = _gemini_meeting_summary_call(
-            cleaned, sentiment_data, topics, participants
-        )
+        summary_struct = _gemini_meeting_summary_call(cleaned, sentiment_data, topics, participants)
+
+        # ✅ snap names inside summary text to detected participant names
+        main_summary = summary_struct.get("main_summary", "")
+        main_summary = _replace_names_in_text(main_summary, detected_names)
+
         enhanced = {
             **base_payload,
-            "main_summary": summary_struct.get("main_summary", ""),
+            "main_summary": main_summary,
             "key_topics": summary_struct.get("key_topics", []),
             "llm_source": "gemini",
         }
@@ -553,43 +540,14 @@ def generate_summary(
         print(f"✗ Error generating summary via Gemini: {e}")
         sentences = _split_into_sentences(cleaned)
         fallback = " ".join(sentences[:5]) if sentences else cleaned[:500]
-        return {
-            **base_payload,
-            "main_summary": fallback,
-            "llm_source": "fallback_error",
-        }
+        return {**base_payload, "main_summary": fallback, "llm_source": "fallback_error"}
 
-
-# -------------------------------------------------------------------
-# PUBLIC API: extract_action_items
-# -------------------------------------------------------------------
 
 def extract_action_items(
     transcript: str,
     speaker_segments: Optional[List[Dict[str, Any]]] = None,
-    participants: Optional[Dict[str, Any]] = None,
+    participants: Optional[Union[Dict[str, Any], List[Any]]] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Extract action items from transcript using Gemini.
-
-    Output keeps the same shape as before (so the rest of your app
-    doesn't need to change):
-
-    [
-      {
-        "action": str,
-        "role": "action" | "decision" | "blocker",
-        "score": float,
-        "confidence": "low" | "medium" | "high",
-        "assignee": Optional[str],
-        "speaker_id": Optional[str],
-        "person_id": Optional[str],
-        "start": Optional[float],
-        "end": Optional[float],
-      },
-      ...
-    ]
-    """
     print("Extracting action items (Gemini)...")
 
     transcript = (transcript or "").strip()
@@ -597,20 +555,16 @@ def extract_action_items(
         return []
 
     if not _GEMINI_AVAILABLE:
-        print(
-            f"✗ Gemini SDK not available; "
-            f"returning no action items ({_GEMINI_IMPORT_ERROR})"
-        )
+        print(f"✗ Gemini SDK not available; returning no action items ({_GEMINI_IMPORT_ERROR})")
         return []
 
     cleaned = _clean_transcript_for_summarization(transcript)
-    max_chars = 12000
-    cleaned = cleaned[:max_chars]
+    cleaned = cleaned[:12000]
+
+    participant_names = _extract_participant_names(participants)
 
     try:
-        gemini_items = _gemini_action_items_call(
-            cleaned, speaker_segments=speaker_segments, participants=participants
-        )
+        gemini_items = _gemini_action_items_call(cleaned, speaker_segments=speaker_segments, participants=participants)
     except Exception as e:
         print(f"✗ Error extracting action items via Gemini: {e}")
         return []
@@ -623,7 +577,10 @@ def extract_action_items(
 
         role = item.get("role", "action")
         confidence = item.get("confidence", "medium")
+
         assignee = item.get("assignee")
+        if assignee:
+            assignee = _snap_name_to_participants(str(assignee), participant_names)
 
         score = 0.5
         if confidence == "high":
@@ -638,14 +595,13 @@ def extract_action_items(
                 "score": score,
                 "confidence": confidence,
                 "assignee": assignee,
-                "speaker_id": None,  # we don't map back to diarization here
+                "speaker_id": None,
                 "person_id": None,
                 "start": None,
                 "end": None,
             }
         )
 
-    # Deduplicate
     seen = set()
     unique: List[Dict[str, Any]] = []
     for it in results:
@@ -656,10 +612,6 @@ def extract_action_items(
 
     print(
         f"✓ Extracted {len(unique)} action items via Gemini"
-        + (
-            f" ({sum(1 for a in unique if a.get('assignee'))} with assignee)"
-            if unique
-            else ""
-        )
+        + (f" ({sum(1 for a in unique if a.get('assignee'))} with assignee)" if unique else "")
     )
     return unique[:20]

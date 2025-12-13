@@ -20,6 +20,7 @@ Thumbs.db
 # Environment variables
 .env
 .env.*
+venv/
 
 # Build artifacts
 dist/
@@ -39,14 +40,31 @@ htmlcov/
 # Output directories and generated files
 output/
 output_local_test.json
+uploads/
+output_*.json
+*_analysis_*.json
 
 # Uploads (meeting files, large user data)
 uploads/
 app/uploads/
 *.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.flv
+*.zip
+*.m4a
 
 # Notebook checkpoints (if using Jupyter)
 .ipynb_checkpoints/
 
 .gemini_key
 .gemini_key.bak
+
+# flask
+instance/
+
+.cache/
+models/
+*.onnx

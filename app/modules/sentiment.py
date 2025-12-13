@@ -29,39 +29,12 @@ def analyze_text_sentiment(
     """
     Analyze text sentiment.
 
-    - If speaker_segments are provided (from speaker-labeled Whisper segments),
+    - If speaker_segments are provided (from speaker-labeled segments),
       we score each utterance separately and aggregate.
     - Otherwise we run sentiment on the whole transcript as a single chunk.
 
-    Returns:
-      {
-        "overall": {
-          "label": "POSITIVE" | "NEGATIVE" | "NEUTRAL",
-          "score": float,  # confidence for the dominant label
-          "distribution": {
-             "positive": float,
-             "negative": float,
-             "neutral": float
-          }
-        },
-        "by_segment": [
-          {
-            "start": float,
-            "end": float,
-            "speaker_id": str,
-            "text": str,
-            "sentiment": {
-               "label": ...,
-               "scores": {
-                 "positive": float,
-                 "negative": float,
-                 "neutral": float
-               }
-            },
-          },
-          ...
-        ]
-      }
+    NOTE:
+    This drop-in keeps your "don't overreact to jokes" behavior unchanged.
     """
     transcript = (transcript or "").strip()
     if not transcript:
@@ -75,10 +48,8 @@ def analyze_text_sentiment(
         }
 
     pipe = _get_sentiment_pipeline()
-
     segments = speaker_segments or []
 
-    # Build the texts we will score
     batched_texts = []
     meta: List[Dict[str, Any]] = []
 
@@ -88,25 +59,24 @@ def analyze_text_sentiment(
             if not text or len(text) < 4:
                 continue
             batched_texts.append(text)
+
+            # ✅ Compatibility: accept either speaker_id or speaker
+            sid = seg.get("speaker_id")
+            if sid is None:
+                sid = seg.get("speaker", "UNKNOWN")
+
             meta.append(
                 {
                     "start": float(seg.get("start", 0.0) or 0.0),
                     "end": float(seg.get("end", 0.0) or 0.0),
-                    "speaker_id": seg.get("speaker_id", "UNKNOWN"),
+                    "speaker_id": sid or "UNKNOWN",
                     "text": text,
                 }
             )
     else:
         text = transcript
         batched_texts.append(text)
-        meta.append(
-            {
-                "start": 0.0,
-                "end": 0.0,
-                "speaker_id": "UNKNOWN",
-                "text": text,
-            }
-        )
+        meta.append({"start": 0.0, "end": 0.0, "speaker_id": "UNKNOWN", "text": text})
 
     if not batched_texts:
         return {
@@ -141,18 +111,13 @@ def analyze_text_sentiment(
             neg = score
             pos = 1.0 - score
 
-        # Turn uncertainty into "neutral" mass
-        # - Large score → confident → less neutral
-        # - ~0.5 score → very neutral
+        # Uncertainty → neutral mass
         max_p = max(pos, neg)
         neutral = 1.0 - max_p
 
-        # Reduce extremes a bit so we don't report 0.99 negative for a chill meeting
+        # Reduce extremes (your original logic)
         pos = max(0.0, pos - neutral * 0.25)
         neg = max(0.0, neg - neutral * 0.25)
-
-        # Normalize so pos+neg+neutral <= 1 (we keep neutral as "uncertainty")
-        # No strict renorm – just leave as is for interpretability.
 
         # Weight by utterance length
         weight = max(1, len(seg_meta["text"].split()))
@@ -161,7 +126,6 @@ def analyze_text_sentiment(
         overall_neu += neutral * weight
         total_weight += weight
 
-        # Decide per-segment label
         if pos >= neg and pos >= neutral:
             seg_label = "POSITIVE"
         elif neg >= pos and neg >= neutral:
@@ -193,7 +157,6 @@ def analyze_text_sentiment(
     overall_neg /= total_weight
     overall_neu /= total_weight
 
-    # Overall label by argmax
     if overall_pos >= overall_neg and overall_pos >= overall_neu:
         overall_label = "POSITIVE"
         overall_score = overall_pos

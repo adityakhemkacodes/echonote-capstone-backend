@@ -1,176 +1,184 @@
 # app/modules/topic_segmentation.py
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.cluster import KMeans
-import numpy as np
+
+from typing import Any, Dict, List, Optional, Tuple
 import re
 
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import KMeans
 
-def segment_topics(text: str, speaker_segments=None, num_topics: int = 3):
+
+def _clean_chunk(text: str) -> str:
+    t = (text or "").strip()
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+
+def _strip_speaker_prefix(text: str) -> str:
     """
-    Simple unsupervised topic segmentation using TF-IDF + KMeans.
-    Returns dict with topics and their representative sentences.
+    If transcript lines look like "Aditya: blah blah", remove "Aditya:".
+    This improves TF-IDF quality.
+    """
+    t = (text or "").strip()
+    # "Name: text"
+    t = re.sub(r"^[A-Za-z][A-Za-z0-9 _-]{0,40}:\s+", "", t)
+    return t.strip()
 
-    For short transcripts or very few sentences, we gracefully fall back
-    to a single-topic summary instead of forcing bad clusters.
+
+def _chunks_from_speaker_segments(speaker_segments: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """
+    Build topic chunks from speaker-labeled segments (best for Zoom mode).
+    Accepts segments like:
+      {start,end,text,speaker_id/speaker,speaker_name}
+    """
+    if not speaker_segments:
+        return []
+
+    chunks: List[Dict[str, Any]] = []
+    for seg in speaker_segments:
+        if not isinstance(seg, dict):
+            continue
+        raw = (seg.get("text") or "").strip()
+        if len(raw) < 20:
+            continue
+
+        cleaned = _clean_chunk(_strip_speaker_prefix(raw))
+        if len(cleaned) < 20:
+            continue
+
+        chunks.append(
+            {
+                "text": cleaned,
+                "start": float(seg.get("start", 0.0) or 0.0),
+                "end": float(seg.get("end", 0.0) or 0.0),
+                "speaker_id": seg.get("speaker_id") or seg.get("speaker") or "UNKNOWN",
+                "speaker_name": seg.get("speaker_name"),
+            }
+        )
+
+    return chunks
+
+
+def _chunks_from_sentences(text: str) -> List[Dict[str, Any]]:
+    """
+    Fallback: split transcript into sentence-like chunks.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    # Split into sentence-ish pieces
+    parts = re.split(r"[.!?]+", text)
+    parts = [_clean_chunk(_strip_speaker_prefix(p)) for p in parts]
+    parts = [p for p in parts if len(p) >= 20]
+
+    return [{"text": p} for p in parts]
+
+
+def segment_topics(text: str, speaker_segments=None, num_topics: int = 3) -> Dict[str, Any]:
+    """
+    Unsupervised topic segmentation using TF-IDF + KMeans.
+
+    Zoom-safe behavior:
+      - Prefer speaker-labeled segments if available (better chunks).
+      - Strip "Name:" prefixes before vectorization.
+      - Robust fallbacks for short transcripts / few chunks.
+      - Return JSON-safe Python primitives (no numpy types).
     """
     print("Segmenting topics...")
 
     text = (text or "").strip()
     if not text:
         print("✗ Topic segmentation skipped (empty transcript)")
-        return {
-            "topics": [],
-            "num_topics": 0,
-        }
+        return {"topics": [], "num_topics": 0}
 
-    # ------------------------------------------------------------------
-    # 1. Handle very short transcripts as a single topic
-    # ------------------------------------------------------------------
-    word_count = len(text.split())
-    if word_count < 40:
+    num_topics = max(1, int(num_topics or 1))
+
+    # If transcript is tiny, avoid clustering
+    if len(text.split()) < 40:
         print("⚠ Transcript too short for reliable topic segmentation – using a single topic")
         summary = text[:500]
+        return {"topics": [{"topic_id": 0, "summary": summary, "sentence_count": 1}], "num_topics": 1}
+
+    # Prefer speaker segments if present (works great in Zoom mode)
+    chunks = _chunks_from_speaker_segments(speaker_segments)
+
+    # Fallback to sentence splitting
+    if not chunks:
+        chunks = _chunks_from_sentences(text)
+
+    if len(chunks) < 3:
+        print("⚠ Not enough chunks for topic segmentation – using a single topic")
+        joined = " ".join([c["text"] for c in chunks]) if chunks else text
         return {
-            "topics": [
-                {
-                    "topic_id": 0,
-                    "summary": summary,
-                    "sentence_count": 1,
-                }
-            ],
+            "topics": [{"topic_id": 0, "summary": joined[:500], "sentence_count": max(1, len(chunks))}],
             "num_topics": 1,
         }
 
+    # If too few chunks to cluster meaningfully, single topic
+    if len(chunks) <= num_topics:
+        print("⚠ Too few distinct chunks to form multiple topics – using a single topic")
+        joined = " ".join([c["text"] for c in chunks])
+        return {"topics": [{"topic_id": 0, "summary": joined[:500], "sentence_count": len(chunks)}], "num_topics": 1}
+
     try:
-        # ------------------------------------------------------------------
-        # 2. Split into sentences
-        # ------------------------------------------------------------------
-        sentences = re.split(r"[.!?]+", text)
-        sentences = [s.strip() for s in sentences if len(s.strip()) > 20]
+        texts = [c["text"] for c in chunks]
 
-        if len(sentences) < 3:
-            print("⚠ Not enough sentences for topic segmentation – using a single topic")
-            joined = " ".join(sentences) if sentences else text
-            summary = joined[:500]
-            return {
-                "topics": [
-                    {
-                        "topic_id": 0,
-                        "summary": summary,
-                        "sentence_count": len(sentences) if sentences else 1,
-                    }
-                ],
-                "num_topics": 1,
-            }
-
-        # If we don't have enough sentences to form multiple topics,
-        # just treat everything as one.
-        if len(sentences) <= num_topics:
-            print("⚠ Too few distinct sentences to form multiple topics – using a single topic")
-            joined = " ".join(sentences)
-            summary = joined[:500]
-            return {
-                "topics": [
-                    {
-                        "topic_id": 0,
-                        "summary": summary,
-                        "sentence_count": len(sentences),
-                    }
-                ],
-                "num_topics": 1,
-            }
-
-        # ------------------------------------------------------------------
-        # 3. Vectorize sentences with TF-IDF
-        # ------------------------------------------------------------------
         vectorizer = TfidfVectorizer(
             stop_words="english",
-            max_features=200,
+            max_features=300,
             min_df=1,
-            ngram_range=(1, 2),  # include some bigrams for better topic separation
+            ngram_range=(1, 2),
         )
+        X = vectorizer.fit_transform(texts)
 
-        X = vectorizer.fit_transform(sentences)
-
-        # ------------------------------------------------------------------
-        # 4. Cluster with KMeans
-        # ------------------------------------------------------------------
-        # Avoid asking for more clusters than we can support
-        # e.g. with 10 sentences and num_topics=3, n_clusters=3 is fine,
-        # but with 5 sentences, 3 clusters is already quite aggressive.
-        n_clusters = min(num_topics, max(1, len(sentences) // 2))
+        # Conservative cluster count: never more than half the chunks
+        n_clusters = min(num_topics, max(1, len(chunks) // 2))
         if n_clusters <= 1:
             print("⚠ Data not rich enough for clustering – using a single topic")
-            joined = " ".join(sentences)
-            summary = joined[:500]
-            return {
-                "topics": [
-                    {
-                        "topic_id": 0,
-                        "summary": summary,
-                        "sentence_count": len(sentences),
-                    }
-                ],
-                "num_topics": 1,
-            }
+            joined = " ".join(texts)
+            return {"topics": [{"topic_id": 0, "summary": joined[:500], "sentence_count": len(chunks)}], "num_topics": 1}
 
         model = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
         model.fit(X)
 
-        # ------------------------------------------------------------------
-        # 5. Extract representative sentences per cluster
-        # ------------------------------------------------------------------
-        topics = []
+        topics: List[Dict[str, Any]] = []
+        labels = model.labels_
+
         for i in range(n_clusters):
-            cluster_indices = np.where(model.labels_ == i)[0]
-            if len(cluster_indices) == 0:
+            cluster_indices = np.where(labels == i)[0]
+            if cluster_indices.size == 0:
                 continue
 
-            cluster_sentences = [sentences[j] for j in cluster_indices]
-
-            # Rank sentences in this cluster by similarity to the centroid
             centroid = model.cluster_centers_[i]
             cluster_vecs = X[cluster_indices]
-            # cluster_vecs is sparse; dot with centroid gives similarity
+
             sims = cluster_vecs.dot(centroid)
-            if hasattr(sims, "A1"):  # sparse -> numpy array
-                sims = sims.A1
+            sims = sims.A1 if hasattr(sims, "A1") else np.array(sims).reshape(-1)
 
-            ranked_indices = cluster_indices[np.argsort(-sims)]
+            ranked_local = np.argsort(-sims)
+            ranked_indices = cluster_indices[ranked_local]
 
-            # Take top 3 representative sentences
-            top_sents = [sentences[j] for j in ranked_indices[:3]]
-            topic_text = ". ".join(top_sents)
+            top_idxs = ranked_indices[:3].tolist()
+            top_texts = [texts[j] for j in top_idxs]
+
+            topic_text = ". ".join(top_texts)
             if len(topic_text) > 500:
-                topic_text = topic_text[:500] + "..."
+                topic_text = topic_text[:500].rstrip() + "..."
 
             topics.append(
                 {
-                    "topic_id": i,
+                    "topic_id": int(i),
                     "summary": topic_text,
-                    "sentence_count": len(cluster_indices),
+                    "sentence_count": int(cluster_indices.size),
                 }
             )
 
-        # Sort topics by how many sentences they cover (most important first)
         topics.sort(key=lambda t: t["sentence_count"], reverse=True)
 
         print(f"✓ Segmented into {len(topics)} topics")
-        return {
-            "topics": topics,
-            "num_topics": len(topics),
-        }
+        return {"topics": topics, "num_topics": int(len(topics))}
 
     except Exception as e:
         print(f"✗ Topic segmentation error: {e}")
-        # Fallback: single topic with truncated transcript
-        return {
-            "topics": [
-                {
-                    "topic_id": 0,
-                    "summary": text[:500],
-                    "sentence_count": 1,
-                }
-            ],
-            "num_topics": 1,
-        }
+        return {"topics": [{"topic_id": 0, "summary": text[:500], "sentence_count": 1}], "num_topics": 1}

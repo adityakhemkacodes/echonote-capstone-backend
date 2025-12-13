@@ -4,10 +4,6 @@ import sys, os
 import json
 from pathlib import Path
 
-# -------------------------------------------------------------------
-# Path setup
-# -------------------------------------------------------------------
-
 ROOT_DIR = Path(__file__).resolve().parent.parent
 APP_DIR = Path(__file__).resolve().parent
 UPLOADS_DIR = APP_DIR / "uploads"
@@ -19,18 +15,24 @@ from app.services.processors import process_meeting_video
 INPUT_VIDEO = str(UPLOADS_DIR / "sample_meeting.mp4")
 OUTPUT_JSON = str(ROOT_DIR / "output_local_test.json")
 
-# -------------------------------------------------------------------
-# PRINTING UTILITIES
-# -------------------------------------------------------------------
 
 def _safe_get(d: dict, *path, default=None):
-    """Safely get nested dict values without KeyError."""
     cur = d
     for p in path:
         if not isinstance(cur, dict) or p not in cur:
             return default
         cur = cur[p]
     return cur
+
+
+def _fmt_time(seconds: float) -> str:
+    try:
+        seconds = float(seconds or 0.0)
+    except Exception:
+        seconds = 0.0
+    m = int(seconds // 60)
+    s = int(seconds % 60)
+    return f"{m}:{s:02d}"
 
 
 def print_summary(results):
@@ -49,9 +51,15 @@ def print_summary(results):
         print(f"  Topics Discussed: {metrics.get('topics_discussed', 0)}")
         print(f"  Action Items: {metrics.get('action_items_count', 0)}")
 
+    # Detect mode hint (Zoom speaker-local vs global)
+    transcription = results.get("transcription", {}) or {}
+    speaker_labeled = transcription.get("speaker_labeled_segments", []) or []
+    zoom_like = bool(speaker_labeled and isinstance(speaker_labeled[0], dict) and "speaker_name" in speaker_labeled[0])
+    time_note = " (speaker-local)" if zoom_like else ""
+
     # ---------------- PARTICIPANTS ----------------
-    participants = results.get("participants", {})
-    names = participants.get("detected_names", [])
+    participants = results.get("participants", {}) or {}
+    names = participants.get("detected_names", []) or []
     print("\n👥 PARTICIPANTS:")
     if names:
         for n in names[:10]:
@@ -60,15 +68,46 @@ def print_summary(results):
         print("  • None detected")
 
     # ---------------- OVERALL MOOD ----------------
+    # ---------------- SENTIMENTS ----------------
+    def _print_dist_as_percent(dist: dict, indent: str = "    • "):
+        for k, v in dist.items():
+            try:
+                pct = float(v) * 100.0
+            except Exception:
+                pct = 0.0
+            print(f"{indent}{k}: {pct:.2f}%")
+
     mood = _safe_get(results, "sentiment", "overall_mood", default={})
-    if mood:
-        print("\n😊 OVERALL MOOD:")
-        print(f"  Dominant Emotion: {mood.get('dominant_emotion', 'N/A')}")
-        facial_dist = mood.get("facial_distribution", {})
-        if facial_dist:
-            print("  Facial Emotions:")
-            for emo, pct in sorted(facial_dist.items(), key=lambda x: x[1], reverse=True):
-                print(f"    • {emo}: {pct}%")
+    facial_raw = _safe_get(results, "sentiment", "facial_sentiment", "overall_raw", default={})
+    facial_cal = _safe_get(results, "sentiment", "facial_sentiment", "overall_calibrated", default={})
+    text_raw = _safe_get(results, "sentiment", "text_sentiment", "raw", "overall", default={})
+    text_cal = _safe_get(results, "sentiment", "text_sentiment", "calibrated", "overall", default={})
+
+    print("\n😊 OVERALL MOOD (Facial-only):")
+    print(f"  Dominant Emotion: {mood.get('dominant_emotion', 'N/A')}")
+
+    if facial_cal:
+        print("\n🙂 FACIAL SENTIMENT (Calibrated):")
+        for emo, pct in sorted(facial_cal.items(), key=lambda x: x[1], reverse=True):
+            print(f"    • {emo}: {pct}%")
+
+    if facial_raw:
+        print("\n🙂 FACIAL SENTIMENT (Raw):")
+        for emo, pct in sorted(facial_raw.items(), key=lambda x: x[1], reverse=True):
+            print(f"    • {emo}: {pct}%")
+
+    if text_cal:
+        print("\n📝 TEXT SENTIMENT (Calibrated):")
+        dist = text_cal.get("distribution", {}) or {}
+        print(f"    • dominant: {text_cal.get('dominant', 'N/A')}")
+        _print_dist_as_percent(dist)
+
+    if text_raw:
+        print("\n📝 TEXT SENTIMENT (Raw):")
+        dist = text_raw.get("distribution", {}) or {}
+        print(f"    • dominant: {text_raw.get('dominant', 'N/A')}")
+        _print_dist_as_percent(dist)
+
 
     # ---------------- KEY MOMENTS ----------------
     key_moments = _safe_get(results, "timeline", "key_moments", default=[])
@@ -76,9 +115,15 @@ def print_summary(results):
         print("\n⚡ KEY MOOD CHANGES:")
         for i, m in enumerate(key_moments[:5], 1):
             ts = m.get("timestamp", 0)
-            print(f"  {i}. At {int(ts//60)}:{int(ts%60):02d}")
-            if "from_emotion" in m:
-                print(f"     {m['from_emotion']} → {m['to_emotion']}")
+            who = m.get("speaker_name") or m.get("speaker_id") or m.get("person_id") or "Unknown"
+            frm = m.get("from")
+            to = m.get("to")
+            print(f"  {i}. At {_fmt_time(ts)}{time_note}  [{who}]")
+            if frm is not None and to is not None:
+                print(f"     {frm} → {to}")
+            ctx = m.get("context")
+            if ctx:
+                print(f"     “{ctx}”")
 
     # ---------------- ACTION ITEMS (GEMINI) ----------------
     action_items = _safe_get(results, "insights", "action_items", default=[])
@@ -103,10 +148,6 @@ def print_summary(results):
     print("\n" + "=" * 60)
 
 
-# -------------------------------------------------------------------
-# MAIN RUNNER
-# -------------------------------------------------------------------
-
 if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("MEETING VIDEO ANALYSIS - LOCAL TEST")
@@ -124,7 +165,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     try:
-        size_mb = os.path.getsize(INPUT_VIDEO) / (1024*1024)
+        size_mb = os.path.getsize(INPUT_VIDEO) / (1024 * 1024)
         print(f"\n📦 File Size: {size_mb:.2f} MB")
         print("\n⏳ Starting analysis...\n")
 
@@ -142,5 +183,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\n❌ ERROR during processing: {e}")
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
