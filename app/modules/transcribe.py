@@ -190,3 +190,62 @@ def identify_speakers(video_path: str, transcript: str = None):
     """
     _, speakers, _ = transcribe_with_speakers(video_path)
     return speakers
+
+# Add to END of app/modules/transcribe.py
+
+def transcribe_individual_audio(audio_path: str, participant_name: str = None):
+    """
+    Transcribe individual participant audio with optional known name.
+    Returns: (transcript_text, segments_with_names)
+    """
+    print(f"Transcribing individual audio: {audio_path}")
+    
+    try:
+        model = whisper.load_model("base", device="cpu")
+        result = model.transcribe(audio_path, fp16=False)
+        
+        transcript_text = (result.get("text") or "").strip()
+        
+        # Add participant name to each segment
+        segments = []
+        for seg in result.get("segments", []):
+            segments.append({
+                "start": float(seg.get("start", 0.0)),
+                "end": float(seg.get("end", 0.0)),
+                "text": seg.get("text", "").strip(),
+                "speaker_name": participant_name,  # Direct name assignment
+                "audio_file": audio_path
+            })
+        
+        return transcript_text, segments
+        
+    except Exception as e:
+        print(f"✗ Error transcribing {audio_path}: {e}")
+        return "", []
+
+
+def transcribe_multiple_audio_files(audio_files_with_names: List[Dict[str, str]]):
+    """
+    Transcribe multiple individual audio files.
+    audio_files_with_names: [{"file": "path", "name": "John Doe"}, ...]
+    Returns: (full_transcript, all_segments_with_speakers)
+    """
+    print(f"Transcribing {len(audio_files_with_names)} individual audio files...")
+    
+    all_segments = []
+    full_texts = []
+    
+    for item in audio_files_with_names:
+        text, segments = transcribe_individual_audio(
+            item["file"], 
+            participant_name=item.get("name")
+        )
+        full_texts.append(text)
+        all_segments.extend(segments)
+    
+    # Sort segments by timestamp
+    all_segments.sort(key=lambda x: x["start"])
+    
+    full_transcript = "\n".join(full_texts)
+    
+    return full_transcript, all_segments
