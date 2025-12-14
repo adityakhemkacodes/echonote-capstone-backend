@@ -450,7 +450,7 @@ class MeetingProcessor:
             self.results["sentiment"] = {"error": str(e)}
             return None
 
-    # -------------------------------------------------------------------------
+        # -------------------------------------------------------------------------
     # STEP 4: TIMELINE & MOOD CHANGES
     # -------------------------------------------------------------------------
     def process_timeline(self) -> Optional[Dict[str, Any]]:
@@ -688,54 +688,75 @@ class MeetingProcessor:
 
     def _calibrate_text_sentiment(self, text_sentiment_raw: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Text padding:
-        - distilbert SST-2 tends to mark sarcasm/jokes as negative
-        - We bias toward neutral/positive, and require stronger evidence for negative.
-        Works off text_sentiment_raw["overall"]["distribution"] if present.
+        Stronger text padding:
+        - SST-2 overflags sarcasm/jokes as negative
+        - We heavily bias toward neutral unless negative is clearly dominant
         """
+
         ts = text_sentiment_raw or {}
         overall = ts.get("overall", {}) if isinstance(ts, dict) else {}
         dist = overall.get("distribution", {}) if isinstance(overall, dict) else {}
 
-        pos = float(dist.get("positive", 0.0) or 0.0)
-        neg = float(dist.get("negative", 0.0) or 0.0)
-        neu = float(dist.get("neutral", 0.0) or 0.0)
+        def _sf(x: Any, default: float = 0.0) -> float:
+            try:
+                return float(x)
+            except Exception:
+                return default
 
-        # If model doesn't provide neutral (common for SST-2), infer
+        pos = _sf(dist.get("positive", 0.0))
+        neg = _sf(dist.get("negative", 0.0))
+        neu = _sf(dist.get("neutral", 0.0))
+
+        # If neutral missing, infer
         if neu <= 0.0 and (pos + neg) > 0.0:
-            # interpret "uncertainty" as neutral-ish
             neu = max(0.0, 1.0 - (pos + neg))
+
         if (pos + neg + neu) <= 0:
             pos, neg, neu = 0.34, 0.33, 0.33
 
-        # --- padding knobs ---
-        # shrink negative significantly unless it is overwhelming
-        # (we don't have utterance-level logits here, so keep it simple)
-        neg_scaled = neg * 0.55
+        # Normalize first (defensive)
+        total0 = pos + neg + neu
+        pos, neg, neu = pos / total0, neg / total0, neu / total0
 
+        # -----------------------------
+        # Padding knobs (STRONG)
+        # -----------------------------
+        NEG_SCALE = 0.40          # was 0.55 (reduce negative more)
+        REDIST_NEU = 0.80         # where the "removed negative" goes
+        REDIST_POS = 0.20
+
+        neg_scaled = neg * NEG_SCALE
         removed = max(0.0, neg - neg_scaled)
 
-        # allocate removed: mostly neutral, some positive
-        neu2 = neu + removed * 0.70
-        pos2 = pos + removed * 0.30
+        neu2 = neu + removed * REDIST_NEU
+        pos2 = pos + removed * REDIST_POS
         neg2 = neg_scaled
 
-        total = pos2 + neg2 + neu2
-        if total > 0:
-            pos2 /= total
-            neg2 /= total
-            neu2 /= total
+        # Optional: add a tiny neutral floor bump (helps jokes)
+        NEU_FLOOR_BONUS = 0.03
+        neu2 += NEU_FLOOR_BONUS
 
-        # rebuild overall
+        total = pos2 + neg2 + neu2
+        pos2, neg2, neu2 = pos2 / total, neg2 / total, neu2 / total
+
+        # -----------------------------
+        # Negative gate (VERY IMPORTANT)
+        # -----------------------------
+        # Only call overall negative if it is clearly dominant.
+        NEG_MIN = 0.55            # must be at least this to be "negative"
+        NEG_MARGIN = 0.12         # must beat both pos & neu by this margin
+
         dominant = "neutral"
-        mx = max(pos2, neg2, neu2)
-        if mx == pos2:
-            dominant = "positive"
-        elif mx == neg2:
+        if (neg2 >= NEG_MIN) and ((neg2 - max(pos2, neu2)) >= NEG_MARGIN):
             dominant = "negative"
         else:
-            dominant = "neutral"
+            # otherwise choose between positive/neutral (with small neutral preference)
+            if pos2 > neu2 + 0.03:
+                dominant = "positive"
+            else:
+                dominant = "neutral"
 
+        # clone input shape safely
         cal = json.loads(json.dumps(ts)) if isinstance(ts, dict) else {}
         cal.setdefault("overall", {})
         cal["overall"]["dominant"] = dominant
@@ -746,36 +767,68 @@ class MeetingProcessor:
         }
         return cal
 
-    def _build_facial_only_overall_mood(self, facial_calibrated: Dict[str, float], text_calibrated: Dict[str, Any]) -> Dict[str, Any]:
-        # facial_calibrated is percent space
-        f = facial_calibrated or {}
+
+    def _build_facial_only_overall_mood(
+        self,
+        facial_calibrated: Dict[str, float],
+        text_calibrated: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Build the display-friendly "overall mood" object.
+
+        - Dominant emotion comes ONLY from calibrated facial distribution (percent space).
+        - Text sentiment is included for separate display (0..1 probs).
+        - Robust to extra keys in facial_calibrated.
+        """
+        # Only accept these facial keys
+        allowed = {"happy", "neutral", "sad"}
+
+        f_in = facial_calibrated or {}
+        f: Dict[str, float] = {}
+
+        for k in allowed:
+            try:
+                f[k] = float(f_in.get(k, 0.0) or 0.0)
+            except Exception:
+                f[k] = 0.0
+
         # pick dominant from facial
         dom = "neutral"
         best = -1.0
-        for k, v in f.items():
-            try:
-                fv = float(v)
-            except Exception:
-                fv = 0.0
-            if fv > best:
-                best = fv
-                dom = str(k)
+        for k in ["happy", "neutral", "sad"]:
+            if f[k] > best:
+                best = f[k]
+                dom = k
 
         # text distribution (0..1)
-        text_overall = (text_calibrated or {}).get("overall", {}) if isinstance(text_calibrated, dict) else {}
-        text_dist = text_overall.get("distribution", {}) if isinstance(text_overall, dict) else {}
+        text_overall = {}
+        text_dist = {}
+
+        if isinstance(text_calibrated, dict):
+            text_overall = text_calibrated.get("overall", {}) or {}
+            if isinstance(text_overall, dict):
+                text_dist = text_overall.get("distribution", {}) or {}
+
+        def _safe_prob(x: Any) -> float:
+            try:
+                v = float(x)
+            except Exception:
+                v = 0.0
+            # clamp to [0,1] so the UI never explodes
+            return max(0.0, min(1.0, v))
 
         return {
             "dominant_emotion": dom,
             "confidence": round(float(best / 100.0), 3) if best >= 0 else 0.0,
-            "facial_distribution": f,  # calibrated facial shown in terminal
-            "text_sentiment": text_overall,  # calibrated text overall, shown separately in terminal
+            "facial_distribution": f,          # calibrated facial %s
+            "text_sentiment": text_overall,    # calibrated text overall (dominant + distribution)
             "text_distribution": {
-                "positive": float(text_dist.get("positive", 0.0) or 0.0),
-                "negative": float(text_dist.get("negative", 0.0) or 0.0),
-                "neutral": float(text_dist.get("neutral", 0.0) or 0.0),
+                "positive": _safe_prob(text_dist.get("positive", 0.0)),
+                "negative": _safe_prob(text_dist.get("negative", 0.0)),
+                "neutral": _safe_prob(text_dist.get("neutral", 0.0)),
             },
         }
+
 
     def _extract_key_moments(self, mood_changes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not mood_changes:
@@ -837,50 +890,88 @@ class MeetingProcessor:
         return aligned
 
     def _calculate_metrics(self, action_items_override: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-        speaker_segments = self.results.get("transcription", {}).get("speaker_segments", []) or []
+        import math
+        import cv2
 
+        # --- 1) Prefer transcript/speaker timing ---
         duration = 0.0
+
+        # Try speaker_segments (often best)
+        speaker_segments = self.results.get("transcription", {}).get("speaker_segments", []) or []
         if speaker_segments:
             try:
                 duration = max(
-                    [float(s.get("end", 0) or 0) for s in speaker_segments if isinstance(s, dict)]
+                    float(s.get("end", 0) or 0)
+                    for s in speaker_segments
+                    if isinstance(s, dict)
                 )
             except Exception:
                 duration = 0.0
 
+        # Fallback: speaker_labeled_segments
+        if not duration:
+            speaker_labeled = self.results.get("transcription", {}).get("speaker_labeled_segments", []) or []
+            if speaker_labeled:
+                try:
+                    duration = max(
+                        float(s.get("end", 0) or 0)
+                        for s in speaker_labeled
+                        if isinstance(s, dict)
+                    )
+                except Exception:
+                    duration = 0.0
+
+        # --- 2) Last resort: video metadata ---
+        video_duration = 0.0
         if not duration:
             try:
                 cap = cv2.VideoCapture(self.video_path)
                 fps = cap.get(cv2.CAP_PROP_FPS) or 0
                 frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
                 cap.release()
-
                 if fps > 0 and frame_count > 0:
-                    duration = frame_count / fps
-                    print(f"ℹ Duration inferred from video metadata: {duration:.2f} seconds")
-                else:
-                    print("⚠ Could not infer duration from video (fps/frame_count missing)")
-            except Exception as e:
-                print(f"⚠ Error while inferring duration from video: {e}")
+                    video_duration = float(frame_count) / float(fps)
+            except Exception:
+                video_duration = 0.0
+            duration = video_duration
 
+        # --- 3) If transcript duration exists but video is slightly longer, clamp to transcript ---
+        # (prevents “extra seconds” at the end)
+        if duration and video_duration:
+            duration = min(duration, video_duration)
+
+        duration_seconds = int(round(duration)) if duration else 0
+        mm = duration_seconds // 60
+        ss = duration_seconds % 60
+        duration_human = f"{mm} minutes {ss} seconds" if duration_seconds else "N/A"
+
+        # Action items list
         if action_items_override is not None:
             action_items_list = action_items_override
         else:
             insights = self.results.get("insights")
             action_items_list = insights.get("action_items", []) if isinstance(insights, dict) else []
 
-        topics_obj = self.results.get("topics", {}) or {}
-        topics_count = len(topics_obj.get("topics", []) or []) if isinstance(topics_obj, dict) else 0
+        # IMPORTANT: mood changes displayed count should match your UI rule (limit=8 after 10s)
+        mood_changes_all = self.results.get("timeline", {}).get("mood_changes", []) or []
+        mood_changes_displayed = 0
+        try:
+            mood_changes_displayed = len([m for m in mood_changes_all if float(m.get("timestamp", 0) or 0) >= 10.0])
+            mood_changes_displayed = min(mood_changes_displayed, 8)
+        except Exception:
+            mood_changes_displayed = min(len(mood_changes_all), 8)
 
         return {
-            "duration_seconds": round(duration, 2),
-            "duration_minutes": round(duration / 60, 2) if duration else 0.0,
+            "duration_seconds": duration_seconds,
+            "duration_human": duration_human,
             "participant_count": self.results.get("participants", {}).get("count", 0),
             "total_words": self.results.get("transcription", {}).get("word_count", 0),
-            "mood_changes": len(self.results.get("timeline", {}).get("mood_changes", []) or []),
+            "mood_changes_displayed": mood_changes_displayed,
             "action_items_count": len(action_items_list or []),
-            "topics_discussed": topics_count,
+            # removed topics_discussed as requested
         }
+
+
 
     def _save_results(self) -> str:
         output_dir = Path("output")

@@ -9,20 +9,14 @@ from typing import Dict, Optional, Tuple, List, Any
 # -------------------------------------------------------------------
 # Emotion mapping -> ONLY 3 classes: happy / neutral / sad
 # -------------------------------------------------------------------
-
 _DEEPFACE_TO_3 = {
-    # positive
     "happy": "happy",
-
-    # neutral-ish
     "neutral": "neutral",
-
-    # negative -> sad bucket
     "sad": "sad",
     "angry": "sad",
     "fear": "sad",
     "disgust": "sad",
-    "surprise": "neutral",  # often spike/noise; treat as neutral
+    "surprise": "neutral",  # noisy spikes; treat as neutral
 }
 
 def _to_3class(emotion: str) -> str:
@@ -30,20 +24,58 @@ def _to_3class(emotion: str) -> str:
     return _DEEPFACE_TO_3.get(e, "neutral")
 
 
+def _normalize_pct(d: Dict[str, float]) -> Dict[str, float]:
+    happy = float(d.get("happy", 0.0) or 0.0)
+    neutral = float(d.get("neutral", 0.0) or 0.0)
+    sad = float(d.get("sad", 0.0) or 0.0)
+    s = happy + neutral + sad
+    if s <= 0:
+        return {"happy": 0.0, "neutral": 100.0, "sad": 0.0}
+    return {
+        "happy": round((happy / s) * 100.0, 2),
+        "neutral": round((neutral / s) * 100.0, 2),
+        "sad": round((sad / s) * 100.0, 2),
+    }
+
+
+def _calibrate_facial(raw_pct: Dict[str, float]) -> Dict[str, float]:
+    """
+    Tiny extra padding:
+    - If neutral is clearly dominant, clamp sad a bit (DeepFace can overcall sad).
+    """
+    r = _normalize_pct(raw_pct)
+
+    n = float(r.get("neutral", 0.0))
+    s = float(r.get("sad", 0.0))
+    h = float(r.get("happy", 0.0))
+
+    # If neutral dominates, reduce sad slightly and give it mostly to neutral
+    if n >= 65.0 and s > 0.0:
+        cut = s * 0.25  # reduce sad by 25%
+        s2 = s - cut
+        n2 = n + cut * 0.80
+        h2 = h + cut * 0.20
+        return _normalize_pct({"happy": h2, "neutral": n2, "sad": s2})
+
+    return r
+
+
 def analyze_facial_sentiment(
     video_path: str,
     face_tracks: list = None,
     person_id_to_name: Optional[Dict[str, str]] = None,
-) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Analyze facial emotions from video.
-
-    face_tracks: list of dicts with {timestamp, bbox, person_id}
-    person_id_to_name: optional mapping like {"PERSON_0": "Aditya Khemka"}
-
     Returns:
       - emotions_timeline: [{timestamp, person_id, emotion, (optional) name}]
-      - overall_sentiment: {"happy": %, "neutral": %, "sad": %}
+      - overall_bundle:
+          {
+            "happy": <calibrated %>,
+            "neutral": <calibrated %>,
+            "sad": <calibrated %>,
+            "overall_raw": {...pct...},
+            "overall_calibrated": {...pct...},
+          }
     """
     print("Analyzing facial sentiment...")
 
@@ -52,9 +84,10 @@ def analyze_facial_sentiment(
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print("✗ Could not open video for facial sentiment")
-        return [], {"neutral": 100.0}
+        raw = {"neutral": 100.0}
+        cal = {"neutral": 100.0, "happy": 0.0, "sad": 0.0}
+        return [], {"happy": 0.0, "neutral": 100.0, "sad": 0.0, "overall_raw": raw, "overall_calibrated": cal}
 
-    # video duration helpers
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
     duration_sec = (frame_count / fps) if fps and frame_count else None
@@ -64,32 +97,44 @@ def analyze_facial_sentiment(
     # -------------------------------------------------------------------
     if not face_tracks:
         print("No face tracks provided, sampling frames across entire video...")
-        timeline, overall = _analyze_from_frames(cap, fps=fps, duration_sec=duration_sec, num_samples=120)
+        timeline, raw_pct = _analyze_from_frames(cap, fps=fps, duration_sec=duration_sec, num_samples=120)
         cap.release()
-        return timeline, overall
+        cal_pct = _calibrate_facial(raw_pct)
+        bundle = {
+            "happy": cal_pct.get("happy", 0.0),
+            "neutral": cal_pct.get("neutral", 100.0),
+            "sad": cal_pct.get("sad", 0.0),
+            "overall_raw": _normalize_pct(raw_pct),
+            "overall_calibrated": cal_pct,
+        }
+        return timeline, bundle
 
-    # Filter + sort
     valid_tracks = [
         t for t in (face_tracks or [])
         if isinstance(t, dict) and ("timestamp" in t) and ("bbox" in t)
     ]
     if not valid_tracks:
         print("⚠ No valid face tracks, falling back to frame sampling")
-        timeline, overall = _analyze_from_frames(cap, fps=fps, duration_sec=duration_sec, num_samples=120)
+        timeline, raw_pct = _analyze_from_frames(cap, fps=fps, duration_sec=duration_sec, num_samples=120)
         cap.release()
-        return timeline, overall
+        cal_pct = _calibrate_facial(raw_pct)
+        bundle = {
+            "happy": cal_pct.get("happy", 0.0),
+            "neutral": cal_pct.get("neutral", 100.0),
+            "sad": cal_pct.get("sad", 0.0),
+            "overall_raw": _normalize_pct(raw_pct),
+            "overall_calibrated": cal_pct,
+        }
+        return timeline, bundle
 
     valid_tracks.sort(key=lambda x: float(x.get("timestamp", 0.0) or 0.0))
 
-    # -------------------------------------------------------------------
-    # KEY FIX: sample across the entire meeting, per person_id
-    # -------------------------------------------------------------------
+    # sample across meeting per person
     tracks_by_pid = defaultdict(list)
     for t in valid_tracks:
         pid = t.get("person_id") or "PERSON_0"
         tracks_by_pid[pid].append(t)
 
-    # total budget across all people; distribute roughly evenly
     MAX_TOTAL_ANALYSES = 240
     pids = list(tracks_by_pid.keys())
     per_person_budget = max(20, int(MAX_TOTAL_ANALYSES / max(1, len(pids))))
@@ -101,7 +146,6 @@ def analyze_facial_sentiment(
             return seq
         step = (len(seq) - 1) / float(k - 1)
         idxs = [int(round(i * step)) for i in range(k)]
-        # keep order, avoid duplicates
         out = []
         seen = set()
         for i in idxs:
@@ -117,7 +161,6 @@ def analyze_facial_sentiment(
         seq_sorted = sorted(seq, key=lambda x: float(x.get("timestamp", 0.0) or 0.0))
         selected_tracks.extend(_uniform_sample(seq_sorted, per_person_budget))
 
-    # Final sort by timestamp so timeline is clean
     selected_tracks.sort(key=lambda x: float(x.get("timestamp", 0.0) or 0.0))
 
     emotions_timeline: List[Dict[str, Any]] = []
@@ -136,7 +179,6 @@ def analyze_facial_sentiment(
             if w <= 0 or h <= 0:
                 continue
 
-            # Expand ROI a bit for stability
             expand_factor = 1.35
             cx = x + w / 2.0
             cy = y + h / 2.0
@@ -178,10 +220,9 @@ def analyze_facial_sentiment(
             except Exception:
                 scores = None
 
-            # Default: trust dominant, but dampen low-confidence calls.
+            # dampen low-confidence
             if isinstance(scores, dict) and raw_emotion in scores:
                 conf = float(scores.get(raw_emotion, 0.0) or 0.0) / 100.0
-                # if confidence is weak, treat as neutral (DeepFace is noisy on video frames)
                 if conf < 0.45:
                     raw_emotion = "neutral"
 
@@ -193,8 +234,6 @@ def analyze_facial_sentiment(
                 "person_id": pid,
                 "emotion": emotion_3,
             }
-
-            # Optional attach name if mapping present
             if pid in person_id_to_name and person_id_to_name[pid]:
                 entry["name"] = person_id_to_name[pid]
 
@@ -206,10 +245,23 @@ def analyze_facial_sentiment(
 
     cap.release()
 
-    overall_sentiment = _aggregate_emotions_3(all_emotions_3)
+    raw_pct = _aggregate_emotions_3(all_emotions_3)
+    cal_pct = _calibrate_facial(raw_pct)
 
     print(f"✓ Facial sentiment analysis complete: {len(emotions_timeline)} frames analyzed")
-    return emotions_timeline, overall_sentiment
+
+    bundle = {
+        # keep top-level keys for backward compatibility (use calibrated)
+        "happy": cal_pct.get("happy", 0.0),
+        "neutral": cal_pct.get("neutral", 100.0),
+        "sad": cal_pct.get("sad", 0.0),
+
+        # also expose raw/cal explicitly for frontend
+        "overall_raw": _normalize_pct(raw_pct),
+        "overall_calibrated": cal_pct,
+    }
+
+    return emotions_timeline, bundle
 
 
 def _analyze_from_frames(
@@ -218,14 +270,14 @@ def _analyze_from_frames(
     duration_sec: Optional[float],
     num_samples: int = 120,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
-    """Fallback: sample frames uniformly across the entire video."""
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-
     if total_frames <= 0:
-        return [], {"neutral": 100.0}
+        return [], {"neutral": 100.0, "happy": 0.0, "sad": 0.0}
 
     num_samples = max(20, int(num_samples))
-    frame_indices = sorted(set(int(i * (total_frames - 1) / (num_samples - 1)) for i in range(num_samples)))
+    frame_indices = sorted(
+        set(int(i * (total_frames - 1) / (num_samples - 1)) for i in range(num_samples))
+    )
 
     emotions_timeline: List[Dict[str, Any]] = []
     all_emotions_3: List[str] = []
@@ -252,27 +304,27 @@ def _analyze_from_frames(
                 raw_emotion = "neutral"
 
             emotion_3 = _to_3class(raw_emotion)
-
             timestamp = float(frame_idx / (fps or 25.0))
-            emotions_timeline.append({"timestamp": timestamp, "person_id": "PERSON_0", "emotion": emotion_3})
+
+            emotions_timeline.append(
+                {"timestamp": timestamp, "person_id": "PERSON_0", "emotion": emotion_3}
+            )
             all_emotions_3.append(emotion_3)
 
         except Exception:
             continue
 
-    overall_sentiment = _aggregate_emotions_3(all_emotions_3)
-    return emotions_timeline, overall_sentiment
+    raw_pct = _aggregate_emotions_3(all_emotions_3)
+    return emotions_timeline, raw_pct
 
 
 def _aggregate_emotions_3(all_emotions_3: List[str]) -> Dict[str, float]:
-    """Return percentage distribution over {happy, neutral, sad}."""
     if not all_emotions_3:
-        return {"neutral": 100.0}
+        return {"happy": 0.0, "neutral": 100.0, "sad": 0.0}
 
     counts = Counter(all_emotions_3)
     total = sum(counts.values()) or 1
 
-    # Always return all 3 keys (frontend easier)
     return {
         "happy": round((counts.get("happy", 0) / total) * 100.0, 2),
         "neutral": round((counts.get("neutral", 0) / total) * 100.0, 2),
