@@ -524,7 +524,6 @@ def generate_summary(
     try:
         summary_struct = _gemini_meeting_summary_call(cleaned, sentiment_data, topics, participants)
 
-        # ✅ snap names inside summary text to detected participant names
         main_summary = summary_struct.get("main_summary", "")
         main_summary = _replace_names_in_text(main_summary, detected_names)
 
